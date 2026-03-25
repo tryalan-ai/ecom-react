@@ -84,6 +84,8 @@ export const getAllProducts = async (req, res, next) => {
     // Calculate pagination
     const offset = (parseInt(page) - 1) * parseInt(limit);
 
+    console.log('[API] GET /products — filters:', JSON.stringify(where), 'sort:', sortBy);
+
     // Execute query
     const { count, rows } = await Product.findAndCountAll({
       where,
@@ -91,6 +93,8 @@ export const getAllProducts = async (req, res, next) => {
       limit: parseInt(limit),
       offset
     });
+
+    console.log('[API] GET /products — returned:', count, 'products, page:', page);
 
     res.json({
       success: true,

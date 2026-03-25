@@ -38,6 +38,7 @@ const CheckoutPage = () => {
   }, [checkoutData]);
 
   const handleShippingSubmit = (shippingInfo, sameAsBilling) => {
+    console.log('[Checkout] Shipping submitted:', { city: shippingInfo.city, state: shippingInfo.state, sameAsBilling });
     setCheckoutData({
       ...checkoutData,
       shipping: shippingInfo,
@@ -47,6 +48,7 @@ const CheckoutPage = () => {
   };
 
   const handlePaymentSubmit = (paymentInfo) => {
+    console.log('[Checkout] Payment submitted:', { method: 'card', last4: paymentInfo.cardNumber?.slice(-4) });
     setCheckoutData({
       ...checkoutData,
       payment: paymentInfo
@@ -55,6 +57,7 @@ const CheckoutPage = () => {
   };
 
   const handleOrderSubmit = async () => {
+    console.log('[Checkout] Placing order:', { itemCount: cart.items.length, total: cart.totals.total });
     setLoading(true);
 
     try {
@@ -105,6 +108,7 @@ const CheckoutPage = () => {
 
       // Navigate to confirmation page first, then clear cart
       // (clearing cart first triggers useEffect redirect to home)
+      console.log('[Checkout] Order placed successfully:', { orderId: response.data.orderId });
       navigate(`/confirmation/${response.data.orderId}`);
 
       // Clear cart and checkout data after navigation

@@ -120,6 +120,7 @@ export const CartProvider = ({ children }) => {
   }, [state]);
 
   const addToCart = (product, quantity = 1) => {
+    console.log('[Cart] Adding to cart:', { productId: product.id, name: product.name, quantity, price: product.price });
     dispatch({
       type: ADD_TO_CART,
       payload: {
@@ -139,6 +140,7 @@ export const CartProvider = ({ children }) => {
   };
 
   const removeFromCart = (productId) => {
+    console.log('[Cart] Removing from cart:', { productId });
     dispatch({ type: REMOVE_FROM_CART, payload: productId });
   };
 
@@ -158,6 +160,7 @@ export const CartProvider = ({ children }) => {
   };
 
   const clearCart = () => {
+    console.log('[Cart] Clearing cart');
     dispatch({ type: CLEAR_CART });
   };
 

@@ -42,7 +42,9 @@ const ProductListPage = () => {
         inStock: filters.inStock !== null ? filters.inStock : undefined
       };
 
+      console.log('[Products] Fetching with params:', params);
       const response = await getProducts(params);
+      console.log('[Products] Loaded:', { count: response.data.products.length, total: response.data.pagination.total });
       setProducts(response.data.products);
       setPagination(response.data.pagination);
     } catch (error) {

@@ -43,6 +43,8 @@ export const createOrder = async (req, res, next) => {
       }
     }
 
+    console.log('[API] POST /orders — customer:', customer.name, 'items:', items.length, 'total:', totals.total);
+
     // Generate order ID
     const orderId = generateOrderId();
 
@@ -96,6 +98,8 @@ export const createOrder = async (req, res, next) => {
         }
       ]
     });
+
+    console.log('[API] Order created:', { orderId, itemCount: orderItems.length, total: totals.total });
 
     res.status(201).json({
       success: true,
