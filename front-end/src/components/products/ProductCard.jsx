@@ -1,4 +1,5 @@
 import { ShoppingCart, Star } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import { formatPrice, calculateDiscountPercentage } from '../../utils/calculations';
 import { useCart } from '../../context/CartContext';
 import { useState } from 'react';
@@ -6,6 +7,7 @@ import Button from '../ui/Button';
 import Toast from '../ui/Toast';
 
 const ProductCard = ({ product }) => {
+  const navigate = useNavigate();
   const { addToCart } = useCart();
   const [showToast, setShowToast] = useState(false);
 
@@ -16,6 +18,10 @@ const ProductCard = ({ product }) => {
     }
   };
 
+  const handleViewDetails = () => {
+    navigate(`/products/${product.id}`);
+  };
+
   const discountPercentage = calculateDiscountPercentage(
     product.originalPrice,
     product.price
@@ -24,12 +30,12 @@ const ProductCard = ({ product }) => {
   return (
     <>
       <div className="card hover:shadow-md transition-shadow group">
-        {/* Image */}
-        <div className="relative mb-3">
+        {/* Image - Clickable to detail page */}
+        <div className="relative mb-3 cursor-pointer overflow-hidden rounded-lg" onClick={handleViewDetails}>
           <img
             src={product.primaryImage}
             alt={product.name}
-            className="w-full h-48 object-cover rounded-lg"
+            className="w-full h-48 object-cover rounded-lg group-hover:scale-105 transition-transform duration-300"
           />
           {discountPercentage > 0 && (
             <span className="absolute top-2 left-2 bg-red-500 text-white text-xs font-bold px-2 py-1 rounded">
@@ -48,8 +54,11 @@ const ProductCard = ({ product }) => {
           {/* Brand */}
           <p className="text-xs text-gray-500 uppercase">{product.brand}</p>
 
-          {/* Name */}
-          <h3 className="font-medium text-gray-900 line-clamp-2 min-h-[2.5rem]">
+          {/* Name - Clickable to detail page */}
+          <h3
+            className="font-medium text-gray-900 line-clamp-2 min-h-[2.5rem] cursor-pointer hover:text-primary-600 transition-colors"
+            onClick={handleViewDetails}
+          >
             {product.name}
           </h3>
 
