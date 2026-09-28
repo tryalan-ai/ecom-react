@@ -1,10 +1,20 @@
 import ProductCard from './ProductCard';
+import InlineLoader from '../ui/InlineLoader';
 import { Package } from 'lucide-react';
 
-const ProductGrid = ({ products, loading }) => {
+const ProductGrid = ({ products, loading, loadStartedAt = null, loadDetail = null }) => {
   if (loading) {
     return (
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
+      <div className="space-y-4">
+        {/* Claude Code/Codex-style inline loader: spinner + live elapsed/step
+            metadata, complementary to the skeleton grid below (kept intact). */}
+        <InlineLoader
+          status="Fetching products"
+          detail={loadDetail}
+          startedAt={loadStartedAt}
+          countLabel="products"
+        />
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-6">
         {[...Array(8)].map((_, i) => (
           <div key={i} className="card animate-pulse">
             <div className="w-full h-48 bg-gray-200 rounded-lg mb-3" />
@@ -15,6 +25,7 @@ const ProductGrid = ({ products, loading }) => {
             </div>
           </div>
         ))}
+        </div>
       </div>
     );
   }

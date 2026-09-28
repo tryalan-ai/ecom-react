@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Button from '../ui/Button';
 import Checkbox from '../ui/Checkbox';
+import InlineLoader from '../ui/InlineLoader';
 import CartSummary from '../cart/CartSummary';
 import { formatPrice } from '../../utils/calculations';
 import { useCart } from '../../context/CartContext';
@@ -8,6 +9,13 @@ import { useCart } from '../../context/CartContext';
 const OrderReview = ({ shippingInfo, paymentInfo, onSubmit, onBack, loading }) => {
   const { cart } = useCart();
   const [agreedToTerms, setAgreedToTerms] = useState(false);
+  const [submitStartedAt, setSubmitStartedAt] = useState(null);
+
+  useEffect(() => {
+    if (loading) {
+      setSubmitStartedAt(Date.now());
+    }
+  }, [loading]);
 
   const handleSubmit = () => {
     if (!agreedToTerms) {
@@ -120,6 +128,16 @@ const OrderReview = ({ shippingInfo, paymentInfo, onSubmit, onBack, loading }) =
           {loading ? 'Processing...' : 'Place Order'}
         </Button>
       </div>
+      {/* Complementary inline loader with live elapsed metadata; the button's
+          disabled + "Processing..." state above is kept intact. */}
+      {loading && (
+        <InlineLoader
+          variant="compact"
+          status="Placing order"
+          detail="Confirming payment · Creating order"
+          startedAt={submitStartedAt}
+        />
+      )}
     </div>
   );
 };

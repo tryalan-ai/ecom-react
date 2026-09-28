@@ -14,6 +14,7 @@ const ProductListPage = () => {
   const [searchTerm, setSearchTerm] = useState('');
   const [sortBy, setSortBy] = useState('featured');
   const [showMobileFilters, setShowMobileFilters] = useState(false);
+  const [fetchStartedAt, setFetchStartedAt] = useState(() => Date.now());
 
   const [filters, setFilters] = useState({
     categories: [],
@@ -30,6 +31,7 @@ const ProductListPage = () => {
 
   const fetchProducts = async () => {
     setLoading(true);
+    setFetchStartedAt(Date.now());
     try {
       const params = {
         search: searchTerm || undefined,
@@ -153,7 +155,16 @@ const ProductListPage = () => {
 
         {/* Product Grid */}
         <div className="flex-1">
-          <ProductGrid products={products} loading={loading} />
+          <ProductGrid
+            products={products}
+            loading={loading}
+            loadStartedAt={fetchStartedAt}
+            loadDetail={
+              searchTerm
+                ? `Searching "${searchTerm}" · ${sortBy}`
+                : `Sorting ${sortBy}`
+            }
+          />
         </div>
       </div>
     </div>

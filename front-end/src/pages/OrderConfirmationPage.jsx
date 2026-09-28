@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { CheckCircle, Package } from 'lucide-react';
 import Button from '../components/ui/Button';
+import InlineLoader from '../components/ui/InlineLoader';
 import { getOrder } from '../utils/api';
 import { formatPrice } from '../utils/calculations';
 
@@ -10,6 +11,7 @@ const OrderConfirmationPage = () => {
   const navigate = useNavigate();
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [loadStartedAt] = useState(() => Date.now());
 
   useEffect(() => {
     fetchOrder();
@@ -28,8 +30,14 @@ const OrderConfirmationPage = () => {
 
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center">
-        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600" />
+      <div className="min-h-screen flex items-center justify-center px-4">
+        {/* Inline loader replaces the bare spinner; layout kept intact. */}
+        <InlineLoader
+          variant="centered"
+          status="Loading order"
+          detail={orderId ? `Order ${orderId}` : null}
+          startedAt={loadStartedAt}
+        />
       </div>
     );
   }
