@@ -29,6 +29,8 @@ const ProductCard = ({ product }) => {
           <img
             src={product.primaryImage}
             alt={product.name}
+            loading="lazy"
+            decoding="async"
             className="w-full h-48 object-cover rounded-lg"
           />
           {discountPercentage > 0 && (
