@@ -111,7 +111,8 @@ cd ecom-react
 
 ```bash
 cd API
-npm install
+npm ci
+mkdir -p database
 npm run seed    # Seed database with 100 products
 npm start       # Start API server on port 3001
 ```
@@ -124,7 +125,7 @@ Open a new terminal window:
 
 ```bash
 cd front-end
-npm install
+npm ci
 npm run dev     # Start development server on port 5173
 ```
 
