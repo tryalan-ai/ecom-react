@@ -51,7 +51,7 @@ test.describe('Responsive Design', () => {
       await expect(page.locator('text=E-Shop')).toBeVisible();
 
       // Cart icon should be visible
-      const cartIcon = page.locator('button:has(svg)').filter({ has: page.locator('[class*="ShoppingCart"]') });
+      const cartIcon = page.getByRole('button', { name: 'Open cart' });
       await expect(cartIcon).toBeVisible();
     });
 

@@ -29,9 +29,10 @@ const SearchBar = ({ onSearch, initialValue = '' }) => {
           <button
             type="button"
             onClick={handleClear}
+            aria-label="Clear search"
             className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
           >
-            <X className="w-5 h-5" />
+            <X className="w-5 h-5" aria-hidden="true" />
           </button>
         )}
       </div>

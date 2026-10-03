@@ -63,7 +63,7 @@ export class TestHelpers {
    * Open cart drawer
    */
   async openCart() {
-    await this.page.locator('header button:has(svg)').click();
+    await this.page.getByRole('button', { name: 'Open cart' }).click();
     await this.page.waitForSelector('text=Shopping Cart', { timeout: 5000 });
   }
 
@@ -71,7 +71,7 @@ export class TestHelpers {
    * Get cart item count from badge
    */
   async getCartCount() {
-    const badge = this.page.locator('header button:has(svg) span');
+    const badge = this.page.getByTestId('cart-badge');
     try {
       const count = await badge.textContent({ timeout: 1000 });
       return parseInt(count || '0');

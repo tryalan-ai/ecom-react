@@ -32,9 +32,10 @@ const CartDrawer = ({ isOpen, onClose }) => {
             <h2 className="text-xl font-bold">Shopping Cart</h2>
             <button
               onClick={onClose}
+              aria-label="Close cart"
               className="p-2 hover:bg-gray-100 rounded-full transition-colors"
             >
-              <X className="w-5 h-5" />
+              <X className="w-5 h-5" aria-hidden="true" />
             </button>
           </div>
 
