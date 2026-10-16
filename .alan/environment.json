@@ -1,0 +1,13 @@
+{
+  "packages": {
+    "apt": ["build-essential", "curl"]
+  },
+  "env": {},
+  "secrets": {},
+  "install": [
+    {
+      "name": "setup",
+      "run": "bash ecom-react/.alan/setup.sh"
+    }
+  ]
+}

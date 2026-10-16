@@ -3,31 +3,29 @@
 #
 # Runs at every session boot from /home/alan/workspace, and again on a disk
 # resume, so it is idempotent: each service is skipped when it is already up.
-# The development target is the `alan` monorepo beside this repository.
+
 set -euo pipefail
 
-WORKSPACE="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-ALAN_REPO="$WORKSPACE/alan"
-PG_BINDIR=/usr/lib/postgresql/16/bin
-PGDATA="$ALAN_REPO/.alan-dev/postgres"
-DEV_DIR="$ALAN_REPO/.alan-dev"
+ECOM_REPO="/home/alan/workspace/ecom-react"
+DEV_DIR="$ECOM_REPO/.alan-dev"
+mkdir -p "$DEV_DIR/logs"
 
-mkdir -p "$DEV_DIR/logs" "$DEV_DIR/redis"
-
-if ! "$PG_BINDIR/pg_isready" -h 127.0.0.1 -p 8432 -q; then
-  nohup "$PG_BINDIR/postgres" -D "$PGDATA" \
-    -h 127.0.0.1 -p 8432 \
-    -c unix_socket_directories=/tmp \
-    -c wal_level=logical \
-    -c max_replication_slots=10 \
-    -c max_wal_senders=10 \
-    > "$DEV_DIR/postgres.log" 2>&1 &
+# Start API server if not already running
+if ! curl -s http://localhost:3001/api/health >/dev/null 2>&1; then
+  cd "$ECOM_REPO/API"
+  nohup npm start > "$DEV_DIR/logs/api.log" 2>&1 &
+  echo "Started API server"
+else
+  echo "API server already running"
 fi
 
-if ! redis-cli -h 127.0.0.1 -p 8379 ping >/dev/null 2>&1; then
-  nohup redis-server --bind 127.0.0.1 --port 8379 --dir "$DEV_DIR/redis" \
-    --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction --save "" \
-    > "$DEV_DIR/redis.log" 2>&1 &
+# Start frontend dev server if not already running
+if ! curl -s http://localhost:5173 >/dev/null 2>&1; then
+  cd "$ECOM_REPO/front-end"
+  nohup npm run dev > "$DEV_DIR/logs/frontend.log" 2>&1 &
+  echo "Started frontend dev server"
+else
+  echo "Frontend dev server already running"
 fi
 
 exit 0
