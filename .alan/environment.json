@@ -1,0 +1,24 @@
+{
+  "packages": {
+    "apt": [
+      "build-essential",
+      "curl",
+      "lsof",
+      "postgresql-16",
+      "python3-dev",
+      "python3-setuptools",
+      "redis-server",
+      "unzip"
+    ]
+  },
+  "env": {
+    "CI": "1"
+  },
+  "secrets": {},
+  "install": [
+    {
+      "name": "setup",
+      "run": "bash ecom-react/.alan/setup.sh"
+    }
+  ]
+}

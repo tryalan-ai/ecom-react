@@ -17,11 +17,9 @@ PG_BINDIR=/usr/lib/postgresql/16/bin
 PGDATA="$ALAN_REPO/.alan-dev/postgres"
 PGPORT=8432
 
-echo "== system packages =="
-sudo apt-get update
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  python3-setuptools build-essential python3-dev \
-  postgresql-16 redis-server curl unzip lsof
+# System packages (build-essential, curl, lsof, postgresql-16, python3-dev,
+# python3-setuptools, redis-server, unzip) are installed by the builder from
+# .alan/environment.json's packages.apt layer, before this script runs.
 
 # The base image can carry a git credential helper; every session of this
 # environment shares the resulting image, so it must not.
