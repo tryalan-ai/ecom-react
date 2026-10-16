@@ -9,7 +9,7 @@ import CartSummary from '../components/cart/CartSummary';
 import { createOrder } from '../utils/api';
 
 const CheckoutPage = () => {
-  const { cart, clearCart } = useCart();
+  const { cart, clearCart, isHydrated } = useCart();
   const navigate = useNavigate();
   const [currentStep, setCurrentStep] = useState(1);
   const [loading, setLoading] = useState(false);
@@ -25,12 +25,14 @@ const CheckoutPage = () => {
         };
   });
 
-  // Redirect to home if cart is empty
+  // Redirect to home if cart is empty, but only once the persisted cart has
+  // been hydrated. Otherwise a direct load of /checkout races the localStorage
+  // read and redirects even when the user has items saved.
   useEffect(() => {
-    if (cart.items.length === 0) {
+    if (isHydrated && cart.items.length === 0) {
       navigate('/');
     }
-  }, [cart.items.length, navigate]);
+  }, [isHydrated, cart.items.length, navigate]);
 
   // Save checkout data to localStorage
   useEffect(() => {

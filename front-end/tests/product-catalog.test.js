@@ -85,7 +85,7 @@ test.describe('Product Catalog', () => {
   });
 
   test('should display cart icon in header', async ({ page }) => {
-    const cartButton = page.locator('header button:has(svg)');
+    const cartButton = page.getByRole('button', { name: 'Open cart' });
     await expect(cartButton).toBeVisible();
   });
 

@@ -39,18 +39,20 @@ const CartItem = ({ item }) => {
         <div className="flex items-center gap-2 mt-2">
           <button
             onClick={handleDecrement}
+            aria-label="Decrease quantity"
             className="p-1 rounded hover:bg-gray-100 transition-colors"
             disabled={item.quantity <= 1}
           >
-            <Minus className="w-4 h-4" />
+            <Minus className="w-4 h-4" aria-hidden="true" />
           </button>
           <span className="w-8 text-center font-medium">{item.quantity}</span>
           <button
             onClick={handleIncrement}
+            aria-label="Increase quantity"
             className="p-1 rounded hover:bg-gray-100 transition-colors"
             disabled={item.quantity >= item.product.stockCount}
           >
-            <Plus className="w-4 h-4" />
+            <Plus className="w-4 h-4" aria-hidden="true" />
           </button>
         </div>
       </div>
@@ -62,9 +64,10 @@ const CartItem = ({ item }) => {
         </p>
         <button
           onClick={handleRemove}
+          aria-label="Remove item"
           className="text-red-600 hover:text-red-700 transition-colors p-1"
         >
-          <Trash2 className="w-4 h-4" />
+          <Trash2 className="w-4 h-4" aria-hidden="true" />
         </button>
       </div>
     </div>
