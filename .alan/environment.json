@@ -7,7 +7,7 @@
   "install": [
     {
       "name": "setup",
-      "run": "bash ecom-react/.alan/setup.sh"
+      "run": "bash .alan/setup.sh"
     }
   ]
 }
