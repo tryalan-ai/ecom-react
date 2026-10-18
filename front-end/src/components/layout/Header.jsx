@@ -25,11 +25,15 @@ const Header = () => {
               {/* Cart */}
               <button
                 onClick={() => setIsCartOpen(true)}
+                aria-label="Open cart"
                 className="relative p-2 text-gray-700 hover:text-primary-600 transition-colors"
               >
-                <ShoppingCart className="w-6 h-6" />
+                <ShoppingCart className="w-6 h-6" aria-hidden="true" />
                 {cartCount > 0 && (
-                  <span className="absolute -top-1 -right-1 bg-primary-600 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center">
+                  <span
+                    data-testid="cart-badge"
+                    className="absolute -top-1 -right-1 bg-primary-600 text-white text-xs font-bold rounded-full w-5 h-5 flex items-center justify-center"
+                  >
                     {cartCount}
                   </span>
                 )}

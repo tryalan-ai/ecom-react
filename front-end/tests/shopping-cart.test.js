@@ -64,7 +64,7 @@ test.describe('Shopping Cart', () => {
       await helpers.openCart();
 
       // Click close button (button next to "Shopping Cart" heading)
-      const closeButton = page.locator('button.hover\\:bg-gray-100.rounded-full').first();
+      const closeButton = page.getByRole('button', { name: 'Close cart' });
       await closeButton.click();
       await page.waitForTimeout(300);
 
@@ -122,7 +122,7 @@ test.describe('Shopping Cart', () => {
       const initialQty = parseInt(await quantitySpan.textContent());
 
       // Find plus button (2nd button in the quantity controls)
-      const plusButton = cartDrawer.locator('.flex.items-center.gap-2 button').nth(1);
+      const plusButton = cartDrawer.getByRole('button', { name: 'Increase quantity' });
       await plusButton.click();
       await page.waitForTimeout(300);
 
@@ -136,7 +136,7 @@ test.describe('Shopping Cart', () => {
       const cartDrawer = page.locator('.fixed.top-0.right-0');
 
       // First increase quantity
-      const plusButton = cartDrawer.locator('.flex.items-center.gap-2 button').nth(1);
+      const plusButton = cartDrawer.getByRole('button', { name: 'Increase quantity' });
       await plusButton.click();
       await page.waitForTimeout(300);
 
@@ -145,7 +145,7 @@ test.describe('Shopping Cart', () => {
       const currentQty = parseInt(await quantitySpan.textContent());
 
       // Then decrease
-      const minusButton = cartDrawer.locator('.flex.items-center.gap-2 button').nth(0);
+      const minusButton = cartDrawer.getByRole('button', { name: 'Decrease quantity' });
       await minusButton.click();
       await page.waitForTimeout(300);
 
@@ -159,7 +159,7 @@ test.describe('Shopping Cart', () => {
       const cartDrawer = page.locator('.fixed.top-0.right-0');
 
       // Try to decrease quantity
-      const minusButton = cartDrawer.locator('.flex.items-center.gap-2 button').nth(0);
+      const minusButton = cartDrawer.getByRole('button', { name: 'Decrease quantity' });
 
       // Button should be disabled
       const isDisabled = await minusButton.isDisabled();
@@ -171,7 +171,7 @@ test.describe('Shopping Cart', () => {
       const cartDrawer = page.locator('.fixed.top-0.right-0');
 
       // Click remove button (button with red text color)
-      const removeButton = cartDrawer.locator('button.text-red-600').first();
+      const removeButton = cartDrawer.getByRole('button', { name: 'Remove item' });
       await removeButton.click();
       await page.waitForTimeout(500);
 
@@ -195,7 +195,7 @@ test.describe('Shopping Cart', () => {
       const initialSubtotal = await cartDrawer.locator('.font-semibold.text-gray-900').first().textContent();
 
       // Increase quantity
-      const plusButton = cartDrawer.locator('.flex.items-center.gap-2 button').nth(1);
+      const plusButton = cartDrawer.getByRole('button', { name: 'Increase quantity' });
       await plusButton.click();
       await page.waitForTimeout(500);
 
@@ -239,7 +239,7 @@ test.describe('Shopping Cart', () => {
       const cartDrawer = page.locator('.fixed.top-0.right-0');
 
       // Add enough products to exceed $100
-      const plusButton = cartDrawer.locator('.flex.items-center.gap-2 button').nth(1);
+      const plusButton = cartDrawer.getByRole('button', { name: 'Increase quantity' });
 
       // Add multiple items
       for (let i = 0; i < 5; i++) {
@@ -308,7 +308,7 @@ test.describe('Shopping Cart', () => {
       const cartDrawer = page.locator('.fixed.top-0.right-0');
 
       // Increase quantity
-      const plusButton = cartDrawer.locator('.flex.items-center.gap-2 button').nth(1);
+      const plusButton = cartDrawer.getByRole('button', { name: 'Increase quantity' });
       await plusButton.click();
       await page.waitForTimeout(300);
 
@@ -377,7 +377,7 @@ test.describe('Shopping Cart', () => {
       const cartDrawer = page.locator('.fixed.top-0.right-0');
 
       // Try to increase quantity many times
-      const plusButton = cartDrawer.locator('.flex.items-center.gap-2 button').nth(1);
+      const plusButton = cartDrawer.getByRole('button', { name: 'Increase quantity' });
 
       for (let i = 0; i < 20; i++) {
         const isDisabled = await plusButton.isDisabled();

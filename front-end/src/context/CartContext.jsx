@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useEffect } from 'react';
+import { createContext, useContext, useReducer, useEffect, useState } from 'react';
 import { calculateCartTotals } from '../utils/calculations';
 
 const CartContext = createContext();
@@ -100,6 +100,10 @@ const initialState = {
 
 export const CartProvider = ({ children }) => {
   const [state, dispatch] = useReducer(cartReducer, initialState);
+  // Tracks whether the persisted cart has been read. Route guards must wait for
+  // this so a direct load of /checkout doesn't see an empty cart and redirect
+  // before the saved cart is hydrated.
+  const [isHydrated, setIsHydrated] = useState(false);
 
   // Load cart from localStorage on mount
   useEffect(() => {
@@ -112,12 +116,15 @@ export const CartProvider = ({ children }) => {
         console.error('Error loading cart from localStorage:', error);
       }
     }
+    setIsHydrated(true);
   }, []);
 
-  // Save cart to localStorage whenever it changes
+  // Save cart to localStorage whenever it changes, but only after hydration so
+  // the initial empty state can't overwrite a persisted cart.
   useEffect(() => {
+    if (!isHydrated) return;
     localStorage.setItem('cart', JSON.stringify(state));
-  }, [state]);
+  }, [state, isHydrated]);
 
   const addToCart = (product, quantity = 1) => {
     dispatch({
@@ -167,6 +174,7 @@ export const CartProvider = ({ children }) => {
 
   const value = {
     cart: state,
+    isHydrated,
     addToCart,
     removeFromCart,
     updateQuantity,

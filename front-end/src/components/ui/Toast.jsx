@@ -26,9 +26,10 @@ const Toast = ({ message, type = 'success', onClose, duration = 3000 }) => {
       <p className="text-sm font-medium text-gray-900">{message}</p>
       <button
         onClick={onClose}
+        aria-label="Dismiss notification"
         className="ml-2 text-gray-400 hover:text-gray-600 transition-colors"
       >
-        <X className="w-4 h-4" />
+        <X className="w-4 h-4" aria-hidden="true" />
       </button>
     </div>
   );
