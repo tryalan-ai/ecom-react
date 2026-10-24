@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .errors import CapacityExceeded, DuplicateEntity, InsufficientStock, NotFound, ValidationError
 from .models import Location, Product, SKU, StockLevel
@@ -102,6 +102,14 @@ class Warehouse:
     def movements(self) -> List[Movement]:
         """The audit log, oldest first."""
         return list(self._movements)
+
+    @property
+    def stock_levels(self) -> List[StockLevel]:
+        """Every stock record, ordered by SKU code then location code."""
+        return sorted(
+            self._stock.values(),
+            key=lambda record: (record.sku.code, record.location.code),
+        )
 
     def product(self, product_id: str) -> Product:
         try:
@@ -296,6 +304,11 @@ class Warehouse:
         """Every stock record whose available quantity has hit its threshold."""
         return [record for record in self._stock.values() if record.is_low]
 
+    def reorder_point(self, sku_code: str) -> int:
+        """The configured reorder threshold for a SKU (``0`` when unset)."""
+        self.sku(sku_code)
+        return self._reorder_defaults.get(sku_code, 0)
+
     def records_for(self, sku_code: str) -> List[StockLevel]:
         """Every stock record held for a SKU, ordered by location code."""
         self.sku(sku_code)
@@ -303,6 +316,63 @@ class Warehouse:
             (record for (code, _), record in self._stock.items() if code == sku_code),
             key=lambda record: record.location.code,
         )
+
+    # ------------------------------------------------------------------
+    # Rehydration
+    # ------------------------------------------------------------------
+    def restore(
+        self,
+        *,
+        stock_levels: Iterable[StockLevel] = (),
+        movements: Iterable[Movement] = (),
+        reorder_points: Optional[Mapping[str, int]] = None,
+    ) -> None:
+        """Load persisted state into a warehouse whose catalog is registered.
+
+        This is the seam a repository uses to rebuild the aggregate without
+        replaying (and therefore duplicating) its movement history.  The
+        catalog -- products, SKUs and locations -- must already be registered
+        and is validated against, never replaced.
+
+        The whole snapshot is validated before any state is mutated, and
+        restoring onto a warehouse that already holds stock or movements
+        raises :class:`ValidationError` so halves of two snapshots cannot be
+        silently merged.
+        """
+        if self._stock or self._movements:
+            raise ValidationError(
+                "cannot restore into a warehouse that already holds stock or movements"
+            )
+
+        defaults: Dict[str, int] = {}
+        for sku_code, units in (reorder_points or {}).items():
+            if sku_code not in self._skus:
+                raise NotFound(f"cannot restore reorder point: no sku {sku_code!r}")
+            if isinstance(units, bool) or not isinstance(units, int) or units < 0:
+                raise ValidationError(
+                    f"reorder point for {sku_code!r} must be a non-negative integer"
+                )
+            defaults[sku_code] = units
+
+        pending: Dict[Tuple[str, str], StockLevel] = {}
+        for record in stock_levels:
+            if not isinstance(record, StockLevel):
+                raise ValidationError("stock_levels must contain StockLevel instances")
+            if record.sku.code not in self._skus:
+                raise NotFound(f"cannot restore stock: no sku {record.sku.code!r}")
+            if record.location.code not in self._locations:
+                raise NotFound(f"cannot restore stock: no location {record.location.code!r}")
+            key = (record.sku.code, record.location.code)
+            if key in pending:
+                raise DuplicateEntity(
+                    f"duplicate stock record for {key[0]!r} at {key[1]!r}"
+                )
+            pending[key] = record
+
+        # Everything below this line is mutation, and cannot fail.
+        self._reorder_defaults = defaults
+        self._stock.update(pending)
+        self._movements = list(movements)
 
     # ------------------------------------------------------------------
     # Internals

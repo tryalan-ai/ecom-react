@@ -7,9 +7,11 @@ from inventory import (
     DuplicateEntity,
     InsufficientStock,
     Location,
+    Movement,
     NotFound,
     Product,
     SKU,
+    StockLevel,
     ValidationError,
     Warehouse,
 )
@@ -215,6 +217,87 @@ class ReportingTests(WarehouseTestCase):
             self.warehouse.available("s-404")
         with self.assertRaises(NotFound):
             self.warehouse.location_occupancy("L-404")
+
+
+class RehydrationTests(unittest.TestCase):
+    """`Warehouse.restore` is the seam a repository rebuilds state through."""
+
+    def setUp(self):
+        self.warehouse = Warehouse("Main")
+        self.product = self.warehouse.add_product(Product("p-1", "Widget", "9.99"))
+        self.sku = self.warehouse.add_sku(SKU("s-1", self.product))
+        self.bin_a = self.warehouse.add_location(Location("A-01", "Bin A1"))
+        self.bin_b = self.warehouse.add_location(Location("B-01", "Bin B1"))
+
+    def record(self, location=None, **overrides):
+        fields = {"sku": self.sku, "location": location or self.bin_a, "quantity": 4}
+        fields.update(overrides)
+        return StockLevel(**fields)
+
+    def test_stock_levels_are_sorted_by_sku_then_location(self):
+        self.warehouse.receive("s-1", "B-01", 1)
+        self.warehouse.receive("s-1", "A-01", 2)
+        self.assertEqual(
+            [record.location.code for record in self.warehouse.stock_levels],
+            ["A-01", "B-01"],
+        )
+
+    def test_reorder_point_defaults_to_zero(self):
+        self.assertEqual(self.warehouse.reorder_point("s-1"), 0)
+        self.warehouse.set_reorder_point("s-1", 6)
+        self.assertEqual(self.warehouse.reorder_point("s-1"), 6)
+
+    def test_restore_rebuilds_a_snapshot_without_logging_movements(self):
+        movement = Movement("receive", "s-1", "A-01", 4)
+        self.warehouse.restore(
+            stock_levels=[self.record()],
+            reorder_points={"s-1": 5},
+            movements=[movement],
+        )
+        self.assertEqual(self.warehouse.stock("s-1", "A-01").quantity, 4)
+        self.assertEqual(self.warehouse.reorder_point("s-1"), 5)
+        self.assertEqual(self.warehouse.movements, [movement])
+
+    def test_restore_refuses_to_merge_into_a_populated_warehouse(self):
+        self.warehouse.receive("s-1", "A-01", 1)
+        with self.assertRaises(ValidationError):
+            self.warehouse.restore(stock_levels=[self.record()])
+        self.assertEqual(self.warehouse.stock("s-1", "A-01").quantity, 1)
+
+    def test_restore_rejects_unknown_skus_and_locations(self):
+        with self.assertRaises(NotFound):
+            self.warehouse.restore(
+                stock_levels=[
+                    StockLevel(sku=SKU("s-404", self.product), location=self.bin_a)
+                ]
+            )
+        with self.assertRaises(NotFound):
+            self.warehouse.restore(
+                stock_levels=[self.record(location=Location("L-404", "Ghost"))]
+            )
+        with self.assertRaises(NotFound):
+            self.warehouse.restore(reorder_points={"s-404": 1})
+
+    def test_restore_rejects_duplicate_and_malformed_rows(self):
+        with self.assertRaises(DuplicateEntity):
+            self.warehouse.restore(stock_levels=[self.record(), self.record()])
+        with self.assertRaises(ValidationError):
+            self.warehouse.restore(reorder_points={"s-1": -1})
+        with self.assertRaises(ValidationError):
+            self.warehouse.restore(stock_levels=["not a stock level"])
+
+    def test_a_rejected_restore_changes_nothing(self):
+        with self.assertRaises(ValidationError):
+            self.warehouse.restore(
+                stock_levels=[self.record()], reorder_points={"s-1": -1}
+            )
+        with self.assertRaises(NotFound):
+            self.warehouse.restore(
+                stock_levels=[self.record(), self.record(location=Location("L-404", "Ghost"))]
+            )
+        self.assertEqual(self.warehouse.stock_levels, [])
+        self.assertFalse(self.warehouse.has_stock_record("s-1", "A-01"))
+        self.assertEqual(self.warehouse.reorder_point("s-1"), 0)
 
 
 if __name__ == "__main__":  # pragma: no cover

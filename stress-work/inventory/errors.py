@@ -28,3 +28,11 @@ class InsufficientStock(InventoryError):
 
 class CapacityExceeded(InventoryError):
     """Raised when a location cannot physically hold any more units."""
+
+
+class MigrationError(InventoryError):
+    """Raised when a migration set is malformed, e.g. duplicate versions."""
+
+
+class StorageError(InventoryError):
+    """Raised when the SQLite persistence layer cannot satisfy a request."""
