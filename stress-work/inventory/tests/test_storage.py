@@ -362,6 +362,33 @@ class TransactionTests(StoreTestCase):
         with self.assertRaises(sqlite3.ProgrammingError):
             store.connection.execute("SELECT 1")
 
+    def test_closing_is_idempotent(self):
+        store = SQLiteStore()
+        store.close()
+        store.close()  # must not raise on the already-closed connection
+        with self.assertRaises(sqlite3.ProgrammingError):
+            store.connection.execute("SELECT 1")
+
+    def test_closing_rolls_back_work_in_flight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "in-flight.db")
+            store = SQLiteStore(path)
+            store.save_location(Location("A-01", "A1"))
+
+            # Enter a transaction by hand and leave it open.
+            context = store.transaction()
+            context.__enter__()
+            store.connection.execute(
+                "INSERT INTO locations (code, name, zone, capacity) "
+                "VALUES ('L-2', 'Two', 'z', NULL)"
+            )
+            self.assertTrue(store.connection.in_transaction)
+
+            store.close()
+            reopened = SQLiteStore(path)
+            self.addCleanup(reopened.close)
+            self.assertEqual([location.code for location in reopened.list_locations()], ["A-01"])
+
 
 class WarehouseRoundTripTests(unittest.TestCase):
     def build(self):

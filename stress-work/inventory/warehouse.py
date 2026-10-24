@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import threading
 from contextlib import contextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from functools import wraps
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
+from .audit import AuditLog, Movement, replay_totals, stock_level_drift
 from .errors import (
+    AuditLogError,
     CapacityExceeded,
     DuplicateEntity,
     InsufficientStock,
@@ -35,7 +35,7 @@ from .models import (
     StockLevel,
 )
 
-__all__ = ["Movement", "Warehouse", "synchronized"]
+__all__ = ["Movement", "AuditLog", "Warehouse", "synchronized"]
 
 
 def synchronized(method):
@@ -54,22 +54,6 @@ def synchronized(method):
     return wrapper
 
 
-@dataclass(frozen=True)
-class Movement:
-    """An immutable audit-log entry describing one change to stock."""
-
-    kind: str
-    sku_code: str
-    location_code: str
-    units: int
-    reference: Optional[str] = None
-    recorded_at: datetime = None  # type: ignore[assignment]
-
-    def __post_init__(self) -> None:
-        if self.recorded_at is None:
-            object.__setattr__(self, "recorded_at", datetime.now(timezone.utc))
-
-
 class Warehouse:
     """A registry of products, SKUs, locations, stock levels and orders."""
 
@@ -82,7 +66,7 @@ class Warehouse:
         self._locations: Dict[str, Location] = {}
         self._stock: Dict[Tuple[str, str], StockLevel] = {}
         self._reorder_defaults: Dict[str, int] = {}
-        self._movements: List[Movement] = []
+        self._movements: AuditLog = AuditLog()
         self._purchase_orders: Dict[str, PurchaseOrder] = {}
         self._sales_orders: Dict[str, SalesOrder] = {}
         self._in_transaction = False
@@ -133,7 +117,7 @@ class Warehouse:
             "locations": dict(self._locations),
             "stock": {key: record.copy() for key, record in self._stock.items()},
             "reorder_points": dict(self._reorder_defaults),
-            "movements": list(self._movements),
+            "movements": len(self._movements),
             "orders": {ref: order.copy() for ref, order in self._purchase_orders.items()},
             "sales": {ref: order.copy() for ref, order in self._sales_orders.items()},
         }
@@ -144,7 +128,9 @@ class Warehouse:
         self._locations = snapshot["locations"]
         self._stock = snapshot["stock"]
         self._reorder_defaults = snapshot["reorder_points"]
-        self._movements = snapshot["movements"]
+        # Only the suffix added since the snapshot is discarded; committed
+        # history is never rewritten.
+        self._movements.rollback_to(snapshot["movements"])
         self._purchase_orders = snapshot["orders"]
         self._sales_orders = snapshot["sales"]
 
@@ -207,8 +193,65 @@ class Warehouse:
     @property
     @synchronized
     def movements(self) -> List[Movement]:
-        """The audit log, oldest first."""
+        """A snapshot list of the audit log, oldest first."""
         return list(self._movements)
+
+    @property
+    @synchronized
+    def audit_log(self) -> AuditLog:
+        """The live append-only log every stock change is written to."""
+        return self._movements
+
+    @synchronized
+    def stock_level_drift(self) -> List[str]:
+        """How the live records disagree with the audit log (empty when healthy)."""
+        return stock_level_drift(self._movements, self._stock.values())
+
+    @synchronized
+    def verify_stock_levels(self) -> None:
+        """Raise :class:`AuditLogError` unless the records match the log."""
+        problems = stock_level_drift(self._movements, self._stock.values())
+        if problems:
+            raise AuditLogError(
+                "stock levels disagree with the audit log: " + "; ".join(problems)
+            )
+
+    @synchronized
+    def rebuild_stock_levels(self) -> List[StockLevel]:
+        """Rebuild every stock record by replaying the audit log from scratch.
+
+        The log is the source of truth, so this discards the current records and
+        reconstructs them: quantities and reservations come from the replayed
+        movements, and reorder points from the per-SKU defaults.  A log that
+        cannot describe a real warehouse raises
+        :class:`~inventory.errors.AuditLogError` and leaves the records alone.
+        """
+        totals = replay_totals(self._movements)
+
+        rebuilt: Dict[Tuple[str, str], StockLevel] = {}
+        for (sku_code, location_code), (quantity, reserved) in totals.items():
+            try:
+                sku = self._skus[sku_code]
+            except KeyError as exc:
+                raise NotFound(
+                    f"the audit log names sku {sku_code!r}, which is not registered"
+                ) from exc
+            try:
+                location = self._locations[location_code]
+            except KeyError as exc:
+                raise NotFound(
+                    f"the audit log names location {location_code!r}, which is not registered"
+                ) from exc
+            rebuilt[(sku_code, location_code)] = StockLevel(
+                sku=sku,
+                location=location,
+                quantity=quantity,
+                reserved=reserved,
+                reorder_point=self._reorder_defaults.get(sku_code, 0),
+            )
+
+        self._stock = rebuilt
+        return self.stock_levels
 
     @property
     @synchronized
@@ -394,12 +437,17 @@ class Warehouse:
             raise ValidationError("counted_units must not be negative")
         self.sku(sku_code)
         location = self.location(location_code)
-        record = self._record(sku_code, location_code)
-        if counted_units < record.reserved:
+        # Check against the existing record without creating one: a stocktake
+        # that is refused must not leave a record the audit log knows nothing
+        # about, or rebuilding from the log would stop matching live state.
+        existing = self._stock.get((sku_code, location_code))
+        reserved = existing.reserved if existing is not None else 0
+        if counted_units < reserved:
             raise InsufficientStock(
                 f"cannot adjust {sku_code} at {location_code} to {counted_units}: "
-                f"{record.reserved} units are reserved"
+                f"{reserved} units are reserved"
             )
+        record = self._record(sku_code, location_code)
         delta = counted_units - record.quantity
         self._check_capacity(location, delta)
         record.quantity = counted_units
@@ -885,7 +933,7 @@ class Warehouse:
         self._stock.update(pending)
         self._purchase_orders = pending_orders
         self._sales_orders = pending_sales
-        self._movements = list(movements)
+        self._movements = AuditLog(movements)
 
     # ------------------------------------------------------------------
     # Internals

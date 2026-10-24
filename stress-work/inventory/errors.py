@@ -52,5 +52,14 @@ class SalesOrderError(InventoryError):
     """
 
 
+class AuditLogError(InventoryError):
+    """Raised when the movement log is treated as mutable, or cannot be replayed.
+
+    Appending is always allowed; editing, reordering or removing committed
+    entries is not.  Replaying raises this too, for an unknown movement kind or
+    a log that describes impossible stock.
+    """
+
+
 class StorageError(InventoryError):
     """Raised when the SQLite persistence layer cannot satisfy a request."""

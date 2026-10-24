@@ -8,7 +8,16 @@ Public API::
 The package uses only the Python standard library.
 """
 
+from .audit import (
+    STOCK_EFFECTS,
+    AuditLog,
+    Movement,
+    movement_delta,
+    replay_totals,
+    stock_level_drift,
+)
 from .errors import (
+    AuditLogError,
     CapacityExceeded,
     DuplicateEntity,
     InsufficientStock,
@@ -41,12 +50,17 @@ from .models import (
     StockLevel,
 )
 from .storage import SQLiteStore
-from .warehouse import Movement, Warehouse, synchronized
+from .warehouse import Warehouse, synchronized
 
 __all__ = [
     "Warehouse",
-    "Movement",
     "synchronized",
+    "Movement",
+    "AuditLog",
+    "STOCK_EFFECTS",
+    "movement_delta",
+    "replay_totals",
+    "stock_level_drift",
     "Product",
     "SKU",
     "Location",
@@ -76,9 +90,10 @@ __all__ = [
     "InsufficientStock",
     "CapacityExceeded",
     "MigrationError",
+    "AuditLogError",
     "PurchaseOrderError",
     "SalesOrderError",
     "StorageError",
 ]
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"

@@ -22,6 +22,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
+from .audit import AuditLog, replay_totals, stock_level_drift
 from .errors import NotFound, StorageError
 from .migrations import LATEST_VERSION, MIGRATIONS, Migration, plan_migrations
 from .models import (
@@ -60,6 +61,7 @@ class SQLiteStore:
             raise StorageError(f"cannot open database at {path!r}: {exc}") from exc
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self._closed = False
         self.migrate()
 
     # ------------------------------------------------------------------
@@ -71,10 +73,29 @@ class SQLiteStore:
         return self._conn
 
     def close(self) -> None:
-        """Roll back anything in flight and close the connection."""
-        if self._conn.in_transaction:
-            self._conn.execute("ROLLBACK")
+        """Roll back anything in flight and close the connection.
+
+        Safe to call more than once: the second call is a no-op, so a caller can
+        close explicitly and still rely on a ``with`` block or a test cleanup.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        self._rollback()
         self._conn.close()
+
+    def _rollback(self) -> None:
+        """Undo the transaction in flight, tolerating an already-closed connection.
+
+        Closing a store while a transaction is open has to roll that work back,
+        and the rollback path can also be reached by garbage collection after the
+        connection is gone, so a closed connection is simply a no-op.
+        """
+        try:
+            if self._conn.in_transaction:
+                self._conn.execute("ROLLBACK")
+        except sqlite3.ProgrammingError:  # pragma: no cover - racy close
+            pass
 
     def __enter__(self) -> "SQLiteStore":
         return self
@@ -96,7 +117,7 @@ class SQLiteStore:
         try:
             yield self._conn
         except BaseException:
-            self._conn.execute("ROLLBACK")
+            self._rollback()
             raise
         self._conn.execute("COMMIT")
 
@@ -442,6 +463,73 @@ class SQLiteStore:
         return [_sales_order_line_from_row(row, self) for row in rows]
 
     # ------------------------------------------------------------------
+    # Audit log: read it, check it, rebuild stock from it
+    # ------------------------------------------------------------------
+    def audit_log(
+        self, sku_code: Optional[str] = None, limit: Optional[int] = None
+    ) -> AuditLog:
+        """The persisted audit log, oldest first."""
+        return AuditLog(self.list_movements(sku_code=sku_code, limit=limit))
+
+    def stock_level_drift(self) -> List[str]:
+        """How the stored stock rows disagree with the stored audit log."""
+        return stock_level_drift(self.audit_log(), self.list_stock_levels())
+
+    def verify_stock_levels(self) -> None:
+        """Raise :class:`StorageError` unless the rows match the audit log."""
+        problems = self.stock_level_drift()
+        if problems:
+            raise StorageError(
+                "stock levels disagree with the audit log: " + "; ".join(problems)
+            )
+
+    def rebuild_stock_levels(self) -> int:
+        """Rewrite the stock table from the audit log, returning the row count.
+
+        The log is the source of truth: rows the log never mentions are dropped,
+        and rows it does mention are recreated at the quantity and reservation it
+        implies.  Reorder points are carried over from the existing row, falling
+        back to the SKU's stored default.  Everything happens in one
+        transaction, so a log naming an unknown SKU changes nothing.
+        """
+        totals = replay_totals(self.audit_log())
+        defaults = self.list_reorder_points()
+        carried = {
+            (row["sku_code"], row["location_code"]): row["reorder_point"]
+            for row in self._conn.execute(
+                "SELECT sku_code, location_code, reorder_point FROM stock_levels"
+            )
+        }
+
+        with self.transaction():
+            for (sku_code, location_code) in totals:
+                if not self._sku_exists(sku_code):
+                    raise NotFound(
+                        f"the audit log names sku {sku_code!r}, which is not stored"
+                    )
+                if not self._location_exists(location_code):
+                    raise NotFound(
+                        f"the audit log names location {location_code!r}, which is not stored"
+                    )
+            self._conn.execute("DELETE FROM stock_levels")
+            for (sku_code, location_code), (quantity, reserved) in totals.items():
+                self._conn.execute(
+                    "INSERT INTO stock_levels "
+                    "(sku_code, location_code, quantity, reserved, reorder_point) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        sku_code,
+                        location_code,
+                        quantity,
+                        reserved,
+                        carried.get(
+                            (sku_code, location_code), defaults.get(sku_code, 0)
+                        ),
+                    ),
+                )
+        return len(totals)
+
+    # ------------------------------------------------------------------
     # Whole-aggregate round trip
     # ------------------------------------------------------------------
     def save_warehouse(self, warehouse: Warehouse) -> Warehouse:
@@ -505,6 +593,14 @@ class SQLiteStore:
         return (
             self._conn.execute(
                 "SELECT 1 FROM skus WHERE code = ?", (sku_code,)
+            ).fetchone()
+            is not None
+        )
+
+    def _location_exists(self, location_code: str) -> bool:
+        return (
+            self._conn.execute(
+                "SELECT 1 FROM locations WHERE code = ?", (location_code,)
             ).fetchone()
             is not None
         )
