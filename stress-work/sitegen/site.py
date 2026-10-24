@@ -3,21 +3,30 @@
 The builder walks a source directory, loads every Markdown file as a
 :class:`Page`, renders each one through a template with a shared navigation
 block, and writes an ``index.html`` listing all pages.
+
+Builds are *incremental* by default. A manifest (``.sitegen-manifest.json``)
+records a content hash for every source file, the template and the navigation
+key, so a rebuild only rewrites the pages that actually changed.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from .blocks import collect_headings, extract_title, parse_blocks, render_blocks
+from .feed import feed_pages, render_rss
 from .frontmatter import parse_front_matter, split_list
 from .htmlutil import escape_attr, escape_text, rel_url
 from .inline import strip_markdown
 from .template import render_template
 
 MARKDOWN_SUFFIXES = (".md", ".markdown")
+MANIFEST_NAME = ".sitegen-manifest.json"
+MANIFEST_VERSION = 1
 
 DEFAULT_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -26,6 +35,7 @@ DEFAULT_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ page.title }} &middot; {{ site.title }}</title>
 <link rel="stylesheet" href="{{ page.asset_prefix }}style.css">
+<link rel="alternate" type="application/rss+xml" title="{{ site.title }}" href="{{ page.asset_prefix }}feed.xml">
 </head>
 <body>
 <header class="site-header">
@@ -49,7 +59,13 @@ class SiteError(Exception):
 
 @dataclass
 class Page:
-    """A single Markdown source file and its rendered form."""
+    """A single Markdown source file and its rendered form.
+
+    Pages loaded from the incremental manifest are marked ``from_cache`` and
+    carry no parsed blocks or rendered body; their title, url, metadata and
+    excerpt are restored from the manifest so navigation still works without
+    re-reading the file.
+    """
 
     source: str
     rel: str
@@ -60,6 +76,9 @@ class Page:
     body_html: str = ""
     headings: list = field(default_factory=list)
     tags: list = field(default_factory=list)
+    excerpt: str = ""
+    content_hash: str = ""
+    from_cache: bool = False
 
 
 @dataclass
@@ -70,6 +89,64 @@ class BuildResult:
     pages: list
     written: list
     index_path: str
+    rebuilt: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)
+    removed: list = field(default_factory=list)
+    forced: bool = False
+    manifest_path: str = ""
+    feed_path: str = ""
+
+    @property
+    def incremental(self):
+        """True when this build reused at least one page from the manifest."""
+        return bool(self.skipped)
+
+
+# ---------------------------------------------------------------------------
+# Hashing and the build manifest
+# ---------------------------------------------------------------------------
+def content_hash(text):
+    """Return a stable hex digest for a piece of source text."""
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _hash_json(value):
+    return content_hash(json.dumps(value, sort_keys=True, ensure_ascii=False))
+
+
+def manifest_path(output_dir):
+    """Path of the build manifest that lives inside the output directory."""
+    return Path(output_dir) / MANIFEST_NAME
+
+
+def load_manifest(output_dir):
+    """Read the manifest from *output_dir*, or return ``None``.
+
+    A missing, unreadable, corrupted or incompatible manifest is treated as
+    "no previous build", which simply triggers a full rebuild.
+    """
+    path = manifest_path(output_dir)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (ValueError, OSError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != MANIFEST_VERSION:
+        return None
+    if not isinstance(data.get("pages"), dict):
+        return None
+    return data
+
+
+def save_manifest(output_dir, data):
+    """Write *data* to the manifest in *output_dir* and return its path."""
+    path = manifest_path(output_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    return str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -106,18 +183,20 @@ def _title_from_path(rel_path):
     return stem.replace("-", " ").replace("_", " ").strip().title()
 
 
-def load_page(path, root):
-    """Read and parse a single Markdown file into a :class:`Page`."""
-    text = Path(path).read_text(encoding="utf-8")
+def parse_page_text(text, rel, root=None):
+    """Parse Markdown *text* into a :class:`Page` (without touching disk)."""
     metadata, body = parse_front_matter(text)
     blocks = parse_blocks(body)
-    rel = Path(os.path.relpath(str(path), str(root))).as_posix()
 
     raw_title = metadata.get("title")
-    title = str(raw_title).strip() if raw_title else (extract_title(blocks) or _title_from_path(rel))
+    if raw_title:
+        title = str(raw_title).strip()
+    else:
+        title = extract_title(blocks) or _title_from_path(rel)
 
+    source = str(Path(root) / rel) if root is not None else rel
     return Page(
-        source=str(path),
+        source=source,
         rel=rel,
         url=page_url(rel),
         title=title,
@@ -126,17 +205,70 @@ def load_page(path, root):
         body_html=render_blocks(blocks),
         headings=collect_headings(blocks),
         tags=split_list(metadata.get("tags")),
+        excerpt=excerpt(blocks),
+        content_hash=content_hash(text),
+        from_cache=False,
     )
+
+
+def load_page(path, root):
+    """Read and parse a single Markdown file into a :class:`Page`."""
+    text = Path(path).read_text(encoding="utf-8")
+    rel = Path(os.path.relpath(str(path), str(root))).as_posix()
+    return parse_page_text(text, rel, root)
+
+
+def page_from_manifest(rel, entry):
+    """Reconstruct a lightweight :class:`Page` from a manifest entry."""
+    metadata = entry.get("metadata") or {}
+    return Page(
+        source="",
+        rel=rel,
+        url=entry["url"],
+        title=entry["title"],
+        metadata=metadata,
+        blocks=[],
+        body_html="",
+        headings=[],
+        tags=split_list(metadata.get("tags")),
+        excerpt=entry.get("excerpt", ""),
+        content_hash=entry.get("hash", ""),
+        from_cache=True,
+    )
+
+
+def _manifest_entry(page):
+    return {
+        "hash": page.content_hash,
+        "url": page.url,
+        "title": page.title,
+        "metadata": page.metadata,
+        "excerpt": page.excerpt,
+    }
+
+
+def _sort_key(page):
+    weight = page.metadata.get("weight")
+    return (weight if isinstance(weight, int) else 10**6, page.rel)
 
 
 def sort_pages(pages):
     """Order pages for navigation: by ``weight`` then by source path."""
+    return sorted(pages, key=_sort_key)
 
-    def key(page):
-        weight = page.metadata.get("weight")
-        return (weight if isinstance(weight, int) else 10**6, page.rel)
 
-    return sorted(pages, key=key)
+def discover_state(source_dir):
+    """Return ``{rel_path: (mtime_ns, size)}`` for every Markdown source."""
+    root = Path(source_dir)
+    state = {}
+    if not root.is_dir():
+        return state
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in MARKDOWN_SUFFIXES:
+            stat = path.stat()
+            rel = path.relative_to(root).as_posix()
+            state[rel] = (stat.st_mtime_ns, stat.st_size)
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -167,7 +299,10 @@ def build_nav(pages, current_url, include_home=True):
     for title, url in entries:
         href = rel_url(url, current_url)
         active = ' class="active"' if url == current_url else ""
-        items.append('<li%s><a href="%s">%s</a></li>' % (active, escape_attr(href), escape_text(title)))
+        items.append(
+            '<li%s><a href="%s">%s</a></li>'
+            % (active, escape_attr(href), escape_text(title))
+        )
     return "<ul>\n" + "\n".join(items) + "\n</ul>"
 
 
@@ -176,11 +311,15 @@ def render_toc(headings):
     items = [h for h in headings if h["level"] in (2, 3)]
     if not items:
         return ""
-    parts = ["<ul class=\"toc\">"]
+    parts = ['<ul class="toc">']
     for heading in items:
         parts.append(
             '<li class="level-%d"><a href="#%s">%s</a></li>'
-            % (heading["level"], escape_attr(heading["id"]), escape_text(strip_markdown(heading["text"])))
+            % (
+                heading["level"],
+                escape_attr(heading["id"]),
+                escape_text(strip_markdown(heading["text"])),
+            )
         )
     parts.append("</ul>")
     return "\n".join(parts)
@@ -194,7 +333,7 @@ def render_index_body(pages, current_url="index.html", site_title=None):
     parts.append('<ul class="page-list">')
     for page in pages:
         href = rel_url(page.url, current_url)
-        summary = excerpt(page.blocks)
+        summary = page.excerpt or excerpt(page.blocks)
         entry = '<li><a href="%s">%s</a>' % (escape_attr(href), escape_text(page.title))
         if summary:
             entry += '<p class="excerpt">%s</p>' % escape_text(summary)
@@ -235,9 +374,6 @@ def _asset_prefix(url):
     return home[: -len("index.html")]
 
 
-# ---------------------------------------------------------------------------
-# Building
-# ---------------------------------------------------------------------------
 def _load_template(template_path):
     if template_path is None:
         return DEFAULT_TEMPLATE
@@ -247,63 +383,238 @@ def _load_template(template_path):
     return path.read_text(encoding="utf-8")
 
 
+# ---------------------------------------------------------------------------
+# Building
+# ---------------------------------------------------------------------------
+def _collect_pages(root, previous, incremental):
+    """Read sources and build metadata for every page, reusing the manifest.
+
+    Returns ``(metas, raw_text, reload_needed)`` where *metas* is a list of
+    ``(rel, page, needs_render)`` tuples in source order. ``raw_text`` maps a
+    relative path to its source text (used for deferred parsing) and
+    ``reload_needed`` is True when at least one page could not be reused.
+    """
+    metas = []
+    raw_text = {}
+    reload_needed = False
+    for path in discover_sources(root):
+        rel = Path(os.path.relpath(str(path), str(root))).as_posix()
+        text = path.read_text(encoding="utf-8")
+        raw_text[rel] = text
+        digest = content_hash(text)
+        entry = previous.get(rel) if incremental else None
+        if entry is not None and entry.get("hash") == digest:
+            metas.append((rel, page_from_manifest(rel, entry), False))
+        else:
+            metas.append((rel, parse_page_text(text, rel, root), True))
+            reload_needed = True
+    return metas, raw_text, reload_needed
+
+
 def build_site(
     source_dir,
     output_dir,
     template_path=None,
     site_title="sitegen",
     include_drafts=False,
+    incremental=True,
+    base_url="",
+    feed=True,
+    build_date=None,
 ):
-    """Build the whole site and return a :class:`BuildResult`."""
+    """Build the site and return a :class:`BuildResult`.
+
+    When ``incremental`` is true (the default) the manifest is used to skip
+    pages whose source hash, the template and the navigation key are all
+    unchanged. ``incremental=False`` forces a full rebuild.
+
+    An RSS 2.0 ``feed.xml`` is written unless ``feed`` is false; ``base_url``
+    supplies absolute links for the feed when set.
+    """
     root = Path(source_dir)
     if not root.is_dir():
         raise SiteError("source directory does not exist: %s" % source_dir)
 
-    template = _load_template(template_path)
-
-    pages = [load_page(path, root) for path in discover_sources(root)]
-    if not include_drafts:
-        pages = [page for page in pages if page.metadata.get("draft") is not True]
-    pages = sort_pages(pages)
-
     out = Path(output_dir)
+    template_source = _load_template(template_path)
+    template_hash = content_hash(template_source)
+
+    previous = load_manifest(out) if incremental else None
+    previous_pages = previous.get("pages", {}) if previous else {}
+
+    metas, raw_text, _ = _collect_pages(root, previous_pages, incremental)
+
+    if not include_drafts:
+        metas = [
+            (rel, page, needs)
+            for (rel, page, needs) in metas
+            if page.metadata.get("draft") is not True
+        ]
+
+    metas.sort(key=lambda item: _sort_key(item[1]))
+
+    nav_key = _hash_json([[page.title, page.url] for (_, page, _) in metas])
+    global_changed = (
+        previous is None
+        or previous.get("template_hash") != template_hash
+        or previous.get("site_title") != site_title
+        or previous.get("include_drafts") != include_drafts
+    )
+    force_all = global_changed or previous.get("nav_key") != nav_key
+
     out.mkdir(parents=True, exist_ok=True)
 
+    pages = []
     written = []
-    for page in pages:
-        html = render_template(template, _page_context(page, pages, site_title))
+    rebuilt = []
+    skipped = []
+
+    # Navigation only depends on each page's title and url, which the manifest
+    # restores, so this list is safe to compute before deferred parsing.
+    nav_pages = metas_pages(metas)
+
+    for rel, page, parsed in metas:
         destination = out / page.url
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_text(html, encoding="utf-8")
-        written.append(str(destination))
+        must_write = force_all or parsed or not destination.exists()
+        if must_write and page.from_cache:
+            # The cached metadata is fine for navigation, but rendering needs
+            # the parsed body, so parse it only now.
+            page = parse_page_text(raw_text[rel], rel, root)
+        if must_write:
+            html = render_template(
+                template_source, _page_context(page, nav_pages, site_title)
+            )
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(html, encoding="utf-8")
+            written.append(str(destination))
+            rebuilt.append(rel)
+        else:
+            skipped.append(rel)
+        pages.append(page)
+
+    # Remove outputs for sources that no longer exist.
+    removed = []
+    current_rels = {rel for (rel, _, _) in metas}
+    for rel, entry in previous_pages.items():
+        if rel not in current_rels:
+            stale = out / entry.get("url", "")
+            if entry.get("url") and stale.exists():
+                stale.unlink()
+                removed.append(str(stale))
 
     index_path = out / "index.html"
     has_explicit_index = any(page.url == "index.html" for page in pages)
     if not has_explicit_index:
-        context = {
-            "site": {
+        index_body = render_index_body(pages, "index.html", site_title)
+        index_key = _hash_json(
+            {
+                "template": template_hash,
                 "title": site_title,
-                "pages": [{"title": p.title, "url": p.url} for p in pages],
-            },
-            "page": {
+                "entries": [
+                    [page.title, page.url, page.excerpt or excerpt(page.blocks)]
+                    for page in pages
+                ],
+            }
+        )
+        previous_index = previous.get("index", {}) if previous else {}
+        needs_index = (
+            previous is None
+            or previous_index.get("key") != index_key
+            or not index_path.exists()
+        )
+        if needs_index:
+            context = {
+                "site": {
+                    "title": site_title,
+                    "pages": [{"title": p.title, "url": p.url} for p in pages],
+                },
+                "page": {
+                    "title": site_title,
+                    "url": "index.html",
+                    "rel": "index.md",
+                    "tags": [],
+                    "headings": [],
+                    "home": "index.html",
+                    "asset_prefix": "",
+                },
+                "content": index_body,
+                "nav": build_nav(pages, "index.html"),
+                "toc": "",
+            }
+            index_path.write_text(
+                render_template(template_source, context), encoding="utf-8"
+            )
+            written.append(str(index_path))
+        index_manifest = {"key": index_key, "url": "index.html"}
+    else:
+        index_manifest = {"key": None, "url": "index.html"}
+
+    feed_path = out / "feed.xml"
+    feed_manifest = None
+    if feed:
+        items = feed_pages(pages)
+        feed_key = _hash_json(
+            {
                 "title": site_title,
-                "url": "index.html",
-                "rel": "index.md",
-                "tags": [],
-                "headings": [],
-                "home": "index.html",
-                "asset_prefix": "",
-            },
-            "content": render_index_body(pages, "index.html", site_title),
-            "nav": build_nav(pages, "index.html"),
-            "toc": "",
-        }
-        index_path.write_text(render_template(template, context), encoding="utf-8")
-        written.append(str(index_path))
+                "base_url": base_url,
+                "items": [
+                    [
+                        page.title,
+                        page.url,
+                        str(page.metadata.get("date", "")),
+                        page.excerpt or excerpt(page.blocks),
+                    ]
+                    for page in items
+                ],
+            }
+        )
+        previous_feed = previous.get("feed", {}) if previous else None
+        needs_feed = (
+            previous is None
+            or not isinstance(previous_feed, dict)
+            or previous_feed.get("key") != feed_key
+            or not feed_path.exists()
+        )
+        if needs_feed:
+            feed_path.write_text(
+                render_rss(
+                    pages,
+                    site_title,
+                    base_url=base_url,
+                    build_date=build_date,
+                    items=items,
+                ),
+                encoding="utf-8",
+            )
+            written.append(str(feed_path))
+        feed_manifest = {"key": feed_key, "url": "feed.xml"}
+
+    manifest = {
+        "version": MANIFEST_VERSION,
+        "template_hash": template_hash,
+        "site_title": site_title,
+        "include_drafts": include_drafts,
+        "nav_key": nav_key,
+        "pages": {rel: _manifest_entry(page) for (rel, page, _) in metas},
+        "index": index_manifest,
+        "feed": feed_manifest,
+    }
+    saved_manifest = save_manifest(out, manifest)
 
     return BuildResult(
         output_dir=str(out),
         pages=pages,
         written=written,
         index_path=str(index_path),
+        rebuilt=rebuilt,
+        skipped=skipped,
+        removed=removed,
+        forced=force_all,
+        manifest_path=saved_manifest,
+        feed_path=str(feed_path) if feed else "",
     )
+
+
+def metas_pages(metas):
+    """Return the :class:`Page` objects held in a ``(rel, page, parsed)`` list."""
+    return [page for (_, page, _) in metas]

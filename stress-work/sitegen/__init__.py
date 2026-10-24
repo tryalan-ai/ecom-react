@@ -24,6 +24,9 @@ __all__ = [
     "blocks",
     "template",
     "site",
+    "sample",
+    "watch",
+    "cli",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
