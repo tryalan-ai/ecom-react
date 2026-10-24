@@ -11,6 +11,7 @@ from inventory import (
     LATEST_VERSION,
     MIGRATIONS,
     CapacityExceeded,
+    InsufficientStock,
     Location,
     Migration,
     Movement,
@@ -21,6 +22,8 @@ from inventory import (
     PurchaseOrderLine,
     SKU,
     SQLiteStore,
+    SalesOrder,
+    SalesOrderLine,
     StorageError,
     StockLevel,
     ValidationError,
@@ -36,6 +39,8 @@ TABLE_NAMES = {
     "reorder_points",
     "purchase_orders",
     "purchase_order_lines",
+    "sales_orders",
+    "sales_order_lines",
     "schema_migrations",
 }
 
@@ -494,6 +499,98 @@ class WarehouseRoundTripTests(unittest.TestCase):
             with self.assertRaises(StorageError):
                 store.save_warehouse("not a warehouse")
 
+    def build_with_sales_orders(self):
+        """The base warehouse plus a shipped, an allocated and a cancelled order."""
+        warehouse = self.build()
+        warehouse.create_sales_order(
+            "SO-1",
+            "Ada Lovelace",
+            [SalesOrderLine(warehouse.sku("s-1"), warehouse.location("A-01"), 3)],
+        )
+        warehouse.allocate_sales_order("SO-1")
+        warehouse.ship_sales_order("SO-1", {"s-1": 1})
+        warehouse.create_sales_order(
+            "SO-2",
+            "Grace Hopper",
+            [SalesOrderLine(warehouse.sku("s-1"), warehouse.location("B-01"), 1)],
+        )
+        warehouse.allocate_sales_order("SO-2")
+        warehouse.create_sales_order(
+            "SO-3",
+            "Alan Turing",
+            [SalesOrderLine(warehouse.sku("s-1"), warehouse.location("A-01"), 1)],
+        )
+        warehouse.cancel_sales_order("SO-3")
+        return warehouse
+
+    def test_sales_orders_survive_a_round_trip(self):
+        warehouse = self.build_with_sales_orders()
+        with SQLiteStore() as store:
+            store.save_warehouse(warehouse)
+            loaded = store.load_warehouse()
+
+            self.assertEqual(loaded.sales_orders, warehouse.sales_orders)
+            shipped = loaded.sales_order("SO-1")
+            self.assertEqual(shipped.status, "partial")
+            self.assertEqual((shipped.reserved_units, shipped.shipped_units), (2, 1))
+            self.assertEqual(shipped.customer, "Ada Lovelace")
+            self.assertEqual(loaded.sales_order("SO-2").status, "allocated")
+            self.assertEqual(loaded.sales_order("SO-3").status, "cancelled")
+            self.assertEqual(loaded.stock("s-1", "A-01").quantity, 6)
+            self.assertEqual(loaded.stock("s-1", "A-01").reserved, 6)
+            self.assertEqual(loaded.stock("s-1", "B-01").reserved, 1)
+
+    def test_a_loaded_warehouse_still_refuses_to_sell_reserved_stock_twice(self):
+        with SQLiteStore() as store:
+            store.save_warehouse(self.build_with_sales_orders())
+            loaded = store.load_warehouse()
+
+            # A-01 is fully reserved, so nothing there can be promised again.
+            loaded.create_sales_order(
+                "SO-10",
+                "Customer",
+                [SalesOrderLine(loaded.sku("s-1"), loaded.location("A-01"), 1)],
+            )
+            with self.assertRaises(InsufficientStock):
+                loaded.allocate_sales_order("SO-10")
+            self.assertEqual(loaded.sales_order("SO-10").status, "open")
+
+            # B-01 still has 2 of its 3 units free.
+            loaded.create_sales_order(
+                "SO-11",
+                "Customer",
+                [SalesOrderLine(loaded.sku("s-1"), loaded.location("B-01"), 2)],
+            )
+            loaded.allocate_sales_order("SO-11")
+            self.assertEqual(loaded.sales_order("SO-11").status, "allocated")
+            self.assertEqual(loaded.stock("s-1", "B-01").reserved, 3)
+
+    def test_a_loaded_warehouse_can_ship_what_was_already_reserved(self):
+        with SQLiteStore() as store:
+            store.save_warehouse(self.build_with_sales_orders())
+            loaded = store.load_warehouse()
+
+            loaded.ship_sales_order("SO-1")
+            self.assertEqual(loaded.sales_order("SO-1").status, "fulfilled")
+            self.assertEqual(loaded.stock("s-1", "A-01").quantity, 4)
+            self.assertEqual(loaded.stock("s-1", "A-01").reserved, 4)
+
+    def test_replacing_a_warehouse_removes_sales_orders_that_are_gone(self):
+        with SQLiteStore() as store:
+            store.save_warehouse(self.build_with_sales_orders())
+            store.save_warehouse(self.build())
+            self.assertEqual(store.count_sales_orders(), 0)
+            self.assertEqual(store.list_sales_order_lines("SO-1"), [])
+
+    def test_saving_a_warehouse_with_sales_orders_twice_does_not_duplicate_lines(self):
+        warehouse = self.build_with_sales_orders()
+        with SQLiteStore() as store:
+            store.save_warehouse(warehouse)
+            store.save_warehouse(warehouse)
+            self.assertEqual(store.count_sales_orders(), 3)
+            self.assertEqual(len(store.list_sales_order_lines("SO-1")), 1)
+            self.assertEqual(len(store.list_sales_order_lines("SO-2")), 1)
+
     def test_low_stock_survives_a_round_trip(self):
         warehouse = Warehouse("Main")
         product = warehouse.add_product(Product("p-1", "Widget", "9.99"))
@@ -601,6 +698,108 @@ class PurchaseOrderPersistenceTests(StoreTestCase):
                 "INSERT INTO purchase_order_lines "
                 "(reference, sku_code, location_code, ordered_units, received_units) "
                 "VALUES ('PO-1', 's-404', 'A-01', 1, 0)"
+            )
+
+
+class SalesOrderPersistenceTests(StoreTestCase):
+    def order(self, reference="SO-1", **overrides):
+        fields = {
+            "reference": reference,
+            "customer": "Ada Lovelace",
+            "lines": [SalesOrderLine(self.sku, self.bin_a, 10, 4, 2)],
+        }
+        fields.update(overrides)
+        return SalesOrder(**fields)
+
+    def test_a_sales_order_round_trips_with_its_lines(self):
+        self.store.save_sales_order(self.order())
+        loaded = self.store.get_sales_order("SO-1")
+        self.assertEqual(loaded.customer, "Ada Lovelace")
+        self.assertEqual(loaded.ordered_units, 10)
+        self.assertEqual(loaded.reserved_units, 4)
+        self.assertEqual(loaded.shipped_units, 2)
+        self.assertEqual(loaded.unallocated_units, 4)
+        self.assertEqual(loaded.status, "partial")
+        self.assertEqual(loaded.line("s-1").location, self.bin_a)
+
+    def test_the_cancelled_flag_round_trips(self):
+        self.store.save_sales_order(self.order())
+        self.assertEqual(self.store.get_sales_order("SO-1").status, "partial")
+        self.store.save_sales_order(self.order(cancelled=True))
+        self.assertEqual(self.store.get_sales_order("SO-1").status, "cancelled")
+
+    def test_resaving_an_order_replaces_its_lines_rather_than_duplicating(self):
+        self.store.save_sales_order(self.order())
+        changed = self.order(lines=[SalesOrderLine(self.sku, self.bin_b, 10, 10)])
+        self.store.save_sales_order(changed)
+        self.assertEqual(self.store.count_sales_orders(), 1)
+        lines = self.store.list_sales_order_lines("SO-1")
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].location.code, "B-01")
+        self.assertEqual(lines[0].shipped_units, 0)
+        self.assertEqual(self.store.get_sales_order("SO-1").status, "allocated")
+
+    def test_orders_are_listed_in_reference_order(self):
+        self.store.save_sales_orders([self.order("SO-2"), self.order("SO-1")])
+        self.assertEqual(
+            [order.reference for order in self.store.list_sales_orders()], ["SO-1", "SO-2"]
+        )
+        self.assertEqual(self.store.list_sales_order_lines("SO-404"), [])
+
+    def test_a_missing_order_raises_not_found(self):
+        with self.assertRaises(NotFound):
+            self.store.get_sales_order("SO-404")
+
+    def test_an_order_cannot_be_stored_without_its_sku_or_location(self):
+        other_product = self.store.save_product(Product("p-2", "Gadget"))
+        other_sku = self.store.save_sku(SKU("s-2", other_product))
+        with self.assertRaises(NotFound):
+            self.store.save_sales_order(
+                self.order(lines=[SalesOrderLine(SKU("s-404", other_product), self.bin_a, 1)])
+            )
+        with self.assertRaises(NotFound):
+            self.store.save_sales_order(
+                self.order(lines=[SalesOrderLine(other_sku, Location("L-404", "Ghost"), 1)])
+            )
+
+    def test_deleting_an_order_cascades_to_its_lines(self):
+        self.store.save_sales_order(self.order())
+        self.store.connection.execute("DELETE FROM sales_orders WHERE reference = 'SO-1'")
+        self.assertEqual(self.store.list_sales_order_lines("SO-1"), [])
+
+    def test_the_schema_forbids_over_allocating_a_line(self):
+        self.store.save_sales_order(self.order())
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "UPDATE sales_order_lines SET reserved_units = 9, shipped_units = 2 "
+                "WHERE reference = 'SO-1'"
+            )
+
+    def test_the_schema_forbids_an_empty_or_negative_line(self):
+        for ordered in (0, -1):
+            with self.subTest(ordered_units=ordered):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.store.connection.execute(
+                        "INSERT INTO sales_order_lines "
+                        "(reference, sku_code, location_code, ordered_units) "
+                        "VALUES ('SO-X', 's-1', 'A-01', ?)",
+                        (ordered,),
+                    )
+
+    def test_the_schema_forbids_negative_reservations(self):
+        self.store.save_sales_order(self.order())
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "UPDATE sales_order_lines SET reserved_units = -1 WHERE reference = 'SO-1'"
+            )
+
+    def test_a_line_cannot_point_at_a_missing_sku(self):
+        self.store.save_sales_order(self.order())
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "INSERT INTO sales_order_lines "
+                "(reference, sku_code, location_code, ordered_units) "
+                "VALUES ('SO-1', 's-404', 'A-01', 1)"
             )
 
 

@@ -136,12 +136,38 @@ CREATE TABLE IF NOT EXISTS purchase_order_lines (
 CREATE INDEX IF NOT EXISTS idx_po_lines_sku ON purchase_order_lines (sku_code);
 """
 
+# ---------------------------------------------------------------------------
+# 005 -- sales orders and the reservations they hold
+# ---------------------------------------------------------------------------
+_CREATE_SALES_ORDERS = """
+CREATE TABLE IF NOT EXISTS sales_orders (
+    reference   TEXT    PRIMARY KEY,
+    customer    TEXT    NOT NULL,
+    cancelled   INTEGER NOT NULL DEFAULT 0 CHECK (cancelled IN (0, 1)),
+    created_at  TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sales_order_lines (
+    reference       TEXT    NOT NULL REFERENCES sales_orders (reference) ON DELETE CASCADE,
+    sku_code        TEXT    NOT NULL REFERENCES skus (code) ON DELETE RESTRICT,
+    location_code   TEXT    NOT NULL REFERENCES locations (code) ON DELETE RESTRICT,
+    ordered_units   INTEGER NOT NULL CHECK (ordered_units >= 1),
+    reserved_units  INTEGER NOT NULL DEFAULT 0 CHECK (reserved_units >= 0),
+    shipped_units   INTEGER NOT NULL DEFAULT 0 CHECK (shipped_units >= 0),
+    PRIMARY KEY (reference, sku_code),
+    CHECK (reserved_units + shipped_units <= ordered_units)
+);
+
+CREATE INDEX IF NOT EXISTS idx_so_lines_sku ON sales_order_lines (sku_code);
+"""
+
 
 MIGRATIONS: Tuple[Migration, ...] = (
     Migration(version=1, name="create_catalog", sql=_CREATE_CATALOG),
     Migration(version=2, name="create_stock_and_movements", sql=_CREATE_STOCK),
     Migration(version=3, name="create_reorder_points", sql=_CREATE_REORDER_POINTS),
     Migration(version=4, name="create_purchase_orders", sql=_CREATE_PURCHASE_ORDERS),
+    Migration(version=5, name="create_sales_orders", sql=_CREATE_SALES_ORDERS),
 )
 
 LATEST_VERSION: int = max(migration.version for migration in MIGRATIONS)

@@ -42,5 +42,15 @@ class PurchaseOrderError(InventoryError):
     """
 
 
+class SalesOrderError(InventoryError):
+    """Raised when a sales-order operation is invalid for the order's state.
+
+    Allocating or shipping against a cancelled or fulfilled order, shipping
+    stock that was never reserved, and cancelling an order that has already
+    shipped all land here.  A request for more stock than is *available*
+    raises :class:`InsufficientStock` instead.
+    """
+
+
 class StorageError(InventoryError):
     """Raised when the SQLite persistence layer cannot satisfy a request."""

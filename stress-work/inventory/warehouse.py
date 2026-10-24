@@ -8,9 +8,11 @@ product, and a location may never hold more units than its capacity).
 
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import wraps
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from .errors import (
@@ -19,11 +21,37 @@ from .errors import (
     InsufficientStock,
     NotFound,
     PurchaseOrderError,
+    SalesOrderError,
     ValidationError,
 )
-from .models import Location, Product, PurchaseOrder, PurchaseOrderLine, SKU, StockLevel
+from .models import (
+    Location,
+    Product,
+    PurchaseOrder,
+    PurchaseOrderLine,
+    SKU,
+    SalesOrder,
+    SalesOrderLine,
+    StockLevel,
+)
 
-__all__ = ["Movement", "Warehouse"]
+__all__ = ["Movement", "Warehouse", "synchronized"]
+
+
+def synchronized(method):
+    """Run ``method`` while holding the warehouse's re-entrant lock.
+
+    Every public warehouse operation takes this lock, so two threads cannot
+    interleave the read-then-write inside an allocation and promise the same
+    units twice.  It is an ``RLock`` because operations legitimately call one
+    another, for example a receipt that opens a transaction and then receives.
+    """
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass(frozen=True)
@@ -56,7 +84,14 @@ class Warehouse:
         self._reorder_defaults: Dict[str, int] = {}
         self._movements: List[Movement] = []
         self._purchase_orders: Dict[str, PurchaseOrder] = {}
+        self._sales_orders: Dict[str, SalesOrder] = {}
         self._in_transaction = False
+        self._lock = threading.RLock()
+
+    @property
+    def lock(self) -> threading.RLock:
+        """The re-entrant lock guarding every operation, exposed for testing."""
+        return self._lock
 
     # ------------------------------------------------------------------
     # Transactions
@@ -67,22 +102,27 @@ class Warehouse:
 
         Everything mutable is snapshotted on entry and restored if the block
         raises, so a multi-line receipt either lands completely or not at all.
+        The warehouse lock is held for the whole block, so no other thread can
+        observe - or interfere with - a half-applied change.
+
         A rollback swaps the warehouse's records for the restored copies, which
         means any aggregate handed out before the failure is detached.
         """
-        if self._in_transaction:
-            raise ValidationError("nested warehouse transactions are not supported")
-        snapshot = self._snapshot()
-        self._in_transaction = True
-        try:
-            yield self
-        except BaseException:
-            self._restore(snapshot)
-            raise
-        finally:
-            self._in_transaction = False
+        with self._lock:
+            if self._in_transaction:
+                raise ValidationError("nested warehouse transactions are not supported")
+            snapshot = self._snapshot()
+            self._in_transaction = True
+            try:
+                yield self
+            except BaseException:
+                self._restore(snapshot)
+                raise
+            finally:
+                self._in_transaction = False
 
     @property
+    @synchronized
     def in_transaction(self) -> bool:
         return self._in_transaction
 
@@ -95,6 +135,7 @@ class Warehouse:
             "reorder_points": dict(self._reorder_defaults),
             "movements": list(self._movements),
             "orders": {ref: order.copy() for ref, order in self._purchase_orders.items()},
+            "sales": {ref: order.copy() for ref, order in self._sales_orders.items()},
         }
 
     def _restore(self, snapshot: Dict[str, Any]) -> None:
@@ -105,10 +146,12 @@ class Warehouse:
         self._reorder_defaults = snapshot["reorder_points"]
         self._movements = snapshot["movements"]
         self._purchase_orders = snapshot["orders"]
+        self._sales_orders = snapshot["sales"]
 
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------
+    @synchronized
     def add_product(self, product: Product) -> Product:
         """Register ``product``; raise :class:`DuplicateEntity` if seen before."""
         if not isinstance(product, Product):
@@ -118,6 +161,7 @@ class Warehouse:
         self._products[product.product_id] = product
         return product
 
+    @synchronized
     def add_sku(self, sku: SKU) -> SKU:
         """Register ``sku``; its product must already be registered."""
         if not isinstance(sku, SKU):
@@ -132,6 +176,7 @@ class Warehouse:
         self._skus[sku.code] = sku
         return sku
 
+    @synchronized
     def add_location(self, location: Location) -> Location:
         """Register ``location``; raise :class:`DuplicateEntity` if seen before."""
         if not isinstance(location, Location):
@@ -145,23 +190,28 @@ class Warehouse:
     # Lookups
     # ------------------------------------------------------------------
     @property
+    @synchronized
     def products(self) -> List[Product]:
         return list(self._products.values())
 
     @property
+    @synchronized
     def skus(self) -> List[SKU]:
         return list(self._skus.values())
 
     @property
+    @synchronized
     def locations(self) -> List[Location]:
         return list(self._locations.values())
 
     @property
+    @synchronized
     def movements(self) -> List[Movement]:
         """The audit log, oldest first."""
         return list(self._movements)
 
     @property
+    @synchronized
     def stock_levels(self) -> List[StockLevel]:
         """Every stock record, ordered by SKU code then location code."""
         return sorted(
@@ -169,24 +219,28 @@ class Warehouse:
             key=lambda record: (record.sku.code, record.location.code),
         )
 
+    @synchronized
     def product(self, product_id: str) -> Product:
         try:
             return self._products[product_id]
         except KeyError as exc:
             raise NotFound(f"no product with id {product_id!r}") from exc
 
+    @synchronized
     def sku(self, code: str) -> SKU:
         try:
             return self._skus[code]
         except KeyError as exc:
             raise NotFound(f"no sku with code {code!r}") from exc
 
+    @synchronized
     def location(self, code: str) -> Location:
         try:
             return self._locations[code]
         except KeyError as exc:
             raise NotFound(f"no location with code {code!r}") from exc
 
+    @synchronized
     def stock(self, sku_code: str, location_code: str) -> StockLevel:
         """Return the existing stock record for a SKU/location pair."""
         try:
@@ -196,9 +250,11 @@ class Warehouse:
                 f"no stock record for sku {sku_code!r} at location {location_code!r}"
             ) from exc
 
+    @synchronized
     def has_stock_record(self, sku_code: str, location_code: str) -> bool:
         return (sku_code, location_code) in self._stock
 
+    @synchronized
     def location_occupancy(self, location_code: str) -> int:
         """Total units held at ``location_code`` across every SKU."""
         self.location(location_code)  # raises NotFound for unknown locations
@@ -208,6 +264,7 @@ class Warehouse:
             if code == location_code
         )
 
+    @synchronized
     def on_hand(self, sku_code: str) -> int:
         """Total quantity of ``sku_code`` across every location."""
         self.sku(sku_code)  # raises NotFound for unknown SKUs
@@ -215,6 +272,7 @@ class Warehouse:
             record.quantity for (code, _), record in self._stock.items() if code == sku_code
         )
 
+    @synchronized
     def available(self, sku_code: str) -> int:
         """Total unreserved quantity of ``sku_code`` across every location."""
         self.sku(sku_code)
@@ -225,6 +283,7 @@ class Warehouse:
     # ------------------------------------------------------------------
     # Movements
     # ------------------------------------------------------------------
+    @synchronized
     def receive(
         self,
         sku_code: str,
@@ -242,6 +301,7 @@ class Warehouse:
         self._log("receive", sku_code, location_code, units, reference)
         return record
 
+    @synchronized
     def pick(
         self,
         sku_code: str,
@@ -261,6 +321,7 @@ class Warehouse:
         self._log("pick", sku_code, location_code, units, reference)
         return record
 
+    @synchronized
     def reserve(
         self,
         sku_code: str,
@@ -275,6 +336,7 @@ class Warehouse:
         self._log("reserve", sku_code, location_code, units, reference)
         return record
 
+    @synchronized
     def release(
         self,
         sku_code: str,
@@ -289,6 +351,7 @@ class Warehouse:
         self._log("release", sku_code, location_code, units, reference)
         return record
 
+    @synchronized
     def transfer(
         self,
         sku_code: str,
@@ -316,6 +379,7 @@ class Warehouse:
         self._log("transfer-in", sku_code, to_code, units, reference)
         return source, destination
 
+    @synchronized
     def adjust(
         self,
         sku_code: str,
@@ -345,6 +409,7 @@ class Warehouse:
     # ------------------------------------------------------------------
     # Reporting
     # ------------------------------------------------------------------
+    @synchronized
     def set_reorder_point(self, sku_code: str, units: int) -> List[StockLevel]:
         """Apply a reorder threshold to a SKU, present and future records."""
         if isinstance(units, bool) or not isinstance(units, int):
@@ -358,15 +423,18 @@ class Warehouse:
             record.reorder_point = units
         return touched
 
+    @synchronized
     def low_stock(self) -> List[StockLevel]:
         """Every stock record whose available quantity has hit its threshold."""
         return [record for record in self._stock.values() if record.is_low]
 
+    @synchronized
     def reorder_point(self, sku_code: str) -> int:
         """The configured reorder threshold for a SKU (``0`` when unset)."""
         self.sku(sku_code)
         return self._reorder_defaults.get(sku_code, 0)
 
+    @synchronized
     def records_for(self, sku_code: str) -> List[StockLevel]:
         """Every stock record held for a SKU, ordered by location code."""
         self.sku(sku_code)
@@ -379,10 +447,12 @@ class Warehouse:
     # Purchase orders
     # ------------------------------------------------------------------
     @property
+    @synchronized
     def purchase_orders(self) -> List[PurchaseOrder]:
         """Every purchase order, ordered by reference."""
         return sorted(self._purchase_orders.values(), key=lambda order: order.reference)
 
+    @synchronized
     def purchase_order(self, reference: str) -> PurchaseOrder:
         """The live (mutable) purchase order with this reference."""
         try:
@@ -390,6 +460,7 @@ class Warehouse:
         except KeyError as exc:
             raise NotFound(f"no purchase order with reference {reference!r}") from exc
 
+    @synchronized
     def create_purchase_order(
         self,
         reference: str,
@@ -426,6 +497,7 @@ class Warehouse:
         self._purchase_orders[order.reference] = order
         return order
 
+    @synchronized
     def receive_purchase_order(
         self,
         reference: str,
@@ -453,6 +525,7 @@ class Warehouse:
                 self.receive(sku_code, line.location.code, units, reference=order.reference)
         return order
 
+    @synchronized
     def cancel_purchase_order(self, reference: str) -> PurchaseOrder:
         """Cancel an order that nothing has been received against yet."""
         order = self.purchase_order(reference)
@@ -509,8 +582,213 @@ class Warehouse:
         return planned
 
     # ------------------------------------------------------------------
+    # Sales orders
+    # ------------------------------------------------------------------
+    @property
+    @synchronized
+    def sales_orders(self) -> List[SalesOrder]:
+        """Every sales order, ordered by reference."""
+        return sorted(self._sales_orders.values(), key=lambda order: order.reference)
+
+    @synchronized
+    def sales_order(self, reference: str) -> SalesOrder:
+        """The live (mutable) sales order with this reference."""
+        try:
+            return self._sales_orders[reference]
+        except KeyError as exc:
+            raise NotFound(f"no sales order with reference {reference!r}") from exc
+
+    @synchronized
+    def create_sales_order(
+        self,
+        reference: str,
+        customer: str,
+        lines: Iterable[SalesOrderLine],
+    ) -> SalesOrder:
+        """Take a customer order without claiming any stock yet.
+
+        Creation never fails for want of stock, so backorders are representable;
+        :meth:`allocate_sales_order` is what turns a line into reservations.
+        """
+        if reference in self._sales_orders:
+            raise DuplicateEntity(f"sales order {reference!r} already exists")
+
+        normalised: List[SalesOrderLine] = []
+        for line in lines:
+            if not isinstance(line, SalesOrderLine):
+                raise ValidationError("lines must contain SalesOrderLine instances")
+            sku = self._skus.get(line.sku.code)
+            if sku is None:
+                raise NotFound(f"cannot sell sku {line.sku.code!r}: it is not registered")
+            location = self._locations.get(line.location.code)
+            if location is None:
+                raise NotFound(
+                    f"cannot sell from location {line.location.code!r}: it is not registered"
+                )
+            normalised.append(
+                SalesOrderLine(sku=sku, location=location, ordered_units=line.ordered_units)
+            )
+
+        order = SalesOrder(reference=reference, customer=customer, lines=normalised)
+        self._sales_orders[order.reference] = order
+        return order
+
+    @synchronized
+    def allocate_sales_order(
+        self,
+        reference: str,
+        quantities: Optional[Mapping[str, int]] = None,
+    ) -> SalesOrder:
+        """Reserve stock for an order so no other order can promise it.
+
+        ``quantities`` maps SKU code to units for a partial allocation; pass
+        ``None`` to claim everything still unallocated.  The reservation and the
+        line's claim move together inside one transaction, so a shortfall on any
+        line leaves the order - and the stock - untouched.  Availability is
+        checked while holding the warehouse lock, which is what stops two
+        threads from reserving the same unit.
+        """
+        order = self.sales_order(reference)
+        if order.cancelled:
+            raise SalesOrderError(f"sales order {reference!r} is cancelled")
+        if order.is_fulfilled:
+            raise SalesOrderError(f"sales order {reference!r} is already fulfilled")
+
+        planned = self._plan_allocations(order, quantities)
+        with self.transaction():
+            for sku_code, units in planned.items():
+                line = order.line(sku_code)
+                self.reserve(sku_code, line.location.code, units, reference=order.reference)
+                line.allocate(units)
+        return order
+
+    @synchronized
+    def ship_sales_order(
+        self,
+        reference: str,
+        quantities: Optional[Mapping[str, int]] = None,
+    ) -> SalesOrder:
+        """Ship reserved stock, spending the reservation exactly once.
+
+        ``quantities`` maps SKU code to units; pass ``None`` to ship everything
+        reserved.  Only reserved units can ship, and shipping decrements on-hand
+        and reserved together, so a unit can be sold at most once.
+        """
+        order = self.sales_order(reference)
+        if order.cancelled:
+            raise SalesOrderError(f"sales order {reference!r} is cancelled")
+        if order.is_fulfilled:
+            raise SalesOrderError(f"sales order {reference!r} is already fulfilled")
+
+        planned = self._plan_shipments(order, quantities)
+        with self.transaction():
+            for sku_code, units in planned.items():
+                line = order.line(sku_code)
+                record = self.stock(sku_code, line.location.code)
+                record.ship(units)
+                line.ship(units)
+                self._log("ship", sku_code, line.location.code, units, order.reference)
+        return order
+
+    @synchronized
+    def cancel_sales_order(self, reference: str) -> SalesOrder:
+        """Cancel an order, releasing whatever stock it still holds."""
+        order = self.sales_order(reference)
+        if order.cancelled:
+            raise SalesOrderError(f"sales order {reference!r} is already cancelled")
+        if order.shipped_units:
+            raise SalesOrderError(
+                f"cannot cancel sales order {reference!r}: "
+                f"{order.shipped_units} units have already shipped"
+            )
+        with self.transaction():
+            for line in order.lines:
+                if line.reserved_units:
+                    self.release(
+                        line.sku.code,
+                        line.location.code,
+                        line.reserved_units,
+                        reference=order.reference,
+                    )
+                    line.release(line.reserved_units)
+            order.cancelled = True
+        return order
+
+    def _plan_allocations(
+        self, order: SalesOrder, quantities: Optional[Mapping[str, int]]
+    ) -> Dict[str, int]:
+        """Validate an allocation request and return {sku_code: units} to claim."""
+        if quantities is None:
+            planned = {
+                line.sku.code: line.unallocated for line in order.lines if line.unallocated
+            }
+            if not planned:
+                raise SalesOrderError(
+                    f"sales order {order.reference!r} has nothing left to allocate"
+                )
+            return planned
+        return self._plan_order_quantities(
+            order, quantities, "allocate", lambda line: line.unallocated
+        )
+
+    def _plan_shipments(
+        self, order: SalesOrder, quantities: Optional[Mapping[str, int]]
+    ) -> Dict[str, int]:
+        """Validate a shipment request and return {sku_code: units} to ship."""
+        if quantities is None:
+            planned = {
+                line.sku.code: line.reserved_units for line in order.lines if line.reserved_units
+            }
+            if not planned:
+                raise SalesOrderError(
+                    f"sales order {order.reference!r} has nothing reserved to ship"
+                )
+            return planned
+        return self._plan_order_quantities(
+            order, quantities, "ship", lambda line: line.reserved_units
+        )
+
+    @staticmethod
+    def _plan_order_quantities(
+        order: SalesOrder,
+        quantities: Mapping[str, int],
+        verb: str,
+        ceiling,
+    ) -> Dict[str, int]:
+        """Shared validation for sales-order quantity mappings."""
+        if not isinstance(quantities, Mapping):
+            raise ValidationError(
+                f"{verb} quantities must be a mapping of sku code to units, or None"
+            )
+        if not quantities:
+            raise ValidationError(
+                f"{verb} quantities must not be empty; pass None to use every line"
+            )
+        planned: Dict[str, int] = {}
+        for sku_code, units in quantities.items():
+            if isinstance(units, bool) or not isinstance(units, int):
+                raise ValidationError(f"{verb} quantity for {sku_code!r} must be a whole number")
+            if units <= 0:
+                raise ValidationError(
+                    f"{verb} quantity for {sku_code!r} must be greater than zero, got {units}"
+                )
+            if sku_code not in order.line_keys:
+                raise ValidationError(
+                    f"sales order {order.reference!r} has no line for sku {sku_code!r}"
+                )
+            line = order.line(sku_code)
+            limit = ceiling(line)
+            if units > limit:
+                raise SalesOrderError(
+                    f"cannot {verb} {units} of {sku_code}: only {limit} available on this line"
+                )
+            planned[sku_code] = units
+        return planned
+
+    # ------------------------------------------------------------------
     # Rehydration
     # ------------------------------------------------------------------
+    @synchronized
     def restore(
         self,
         *,
@@ -518,6 +796,7 @@ class Warehouse:
         movements: Iterable[Movement] = (),
         reorder_points: Optional[Mapping[str, int]] = None,
         purchase_orders: Iterable[PurchaseOrder] = (),
+        sales_orders: Iterable[SalesOrder] = (),
     ) -> None:
         """Load persisted state into a warehouse whose catalog is registered.
 
@@ -531,7 +810,7 @@ class Warehouse:
         :class:`ValidationError` so halves of two snapshots cannot be silently
         merged.
         """
-        if self._stock or self._movements or self._purchase_orders:
+        if self._stock or self._movements or self._purchase_orders or self._sales_orders:
             raise ValidationError(
                 "cannot restore into a warehouse that already holds state"
             )
@@ -576,10 +855,36 @@ class Warehouse:
                     )
             pending_orders[order.reference] = order
 
+        pending_sales: Dict[str, SalesOrder] = {}
+        for order in sales_orders:
+            if not isinstance(order, SalesOrder):
+                raise ValidationError("sales_orders must contain SalesOrder instances")
+            if order.reference in pending_sales:
+                raise DuplicateEntity(f"duplicate sales order {order.reference!r}")
+            for line in order.lines:
+                if line.sku.code not in self._skus:
+                    raise NotFound(f"cannot restore order: no sku {line.sku.code!r}")
+                if line.location.code not in self._locations:
+                    raise NotFound(
+                        f"cannot restore order: no location {line.location.code!r}"
+                    )
+                # A reservation must be backed by stock we actually hold.
+                record = pending.get((line.sku.code, line.location.code))
+                if line.reserved_units and (
+                    record is None or record.reserved < line.reserved_units
+                ):
+                    raise ValidationError(
+                        f"cannot restore sales order {order.reference!r}: "
+                        f"{line.reserved_units} units of {line.sku.code!r} are reserved "
+                        f"but the stock record does not match"
+                    )
+            pending_sales[order.reference] = order
+
         # Everything below this line is mutation, and cannot fail.
         self._reorder_defaults = defaults
         self._stock.update(pending)
         self._purchase_orders = pending_orders
+        self._sales_orders = pending_sales
         self._movements = list(movements)
 
     # ------------------------------------------------------------------

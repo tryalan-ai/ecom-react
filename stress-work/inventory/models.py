@@ -13,7 +13,13 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import List, Optional, Tuple
 
-from .errors import InsufficientStock, NotFound, PurchaseOrderError, ValidationError
+from .errors import (
+    InsufficientStock,
+    NotFound,
+    PurchaseOrderError,
+    SalesOrderError,
+    ValidationError,
+)
 
 __all__ = [
     "Product",
@@ -22,10 +28,17 @@ __all__ = [
     "StockLevel",
     "PurchaseOrderLine",
     "PurchaseOrder",
+    "SalesOrderLine",
+    "SalesOrder",
     "ORDER_OPEN",
     "ORDER_PARTIAL",
     "ORDER_RECEIVED",
     "ORDER_CANCELLED",
+    "SALES_OPEN",
+    "SALES_PARTIAL",
+    "SALES_ALLOCATED",
+    "SALES_FULFILLED",
+    "SALES_CANCELLED",
 ]
 
 
@@ -221,6 +234,22 @@ class StockLevel:
             )
         self.reserved -= units
 
+    def ship(self, units: int) -> None:
+        """Consume a reservation and take ``units`` off the shelf.
+
+        Shipping is the only operation that may touch reserved stock: it
+        decrements ``quantity`` and ``reserved`` together, so a reservation is
+        spent exactly once.
+        """
+        units = _require_positive(units, "units")
+        if units > self.reserved:
+            raise InsufficientStock(
+                f"cannot ship {units} of {self.sku.code} at {self.location.code}: "
+                f"only {self.reserved} reserved"
+            )
+        self.quantity -= units
+        self.reserved -= units
+
     def copy(self) -> "StockLevel":
         """A detached duplicate of this record, used for transaction snapshots."""
         return StockLevel(
@@ -395,4 +424,228 @@ class PurchaseOrder:
         return (
             f"{self.reference} ({self.supplier}) {self.status} "
             f"{self.received_units}/{self.ordered_units}"
+        )
+
+
+# Sales order lifecycle states, derived the same way as purchase orders.
+SALES_OPEN = "open"
+SALES_PARTIAL = "partial"
+SALES_ALLOCATED = "allocated"
+SALES_FULFILLED = "fulfilled"
+SALES_CANCELLED = "cancelled"
+
+SALES_ORDER_STATES: Tuple[str, ...] = (
+    SALES_OPEN,
+    SALES_PARTIAL,
+    SALES_ALLOCATED,
+    SALES_FULFILLED,
+    SALES_CANCELLED,
+)
+
+
+@dataclass
+class SalesOrderLine:
+    """One SKU promised to a customer, and the bin it should ship from.
+
+    ``reserved_units`` is a *live* claim on stock: it goes down when units ship
+    or when the order is cancelled, and it is exactly the quantity held aside so
+    no other order can promise the same units.  ``shipped_units`` is cumulative.
+    """
+
+    sku: SKU
+    location: Location
+    ordered_units: int
+    reserved_units: int = 0
+    shipped_units: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sku, SKU):
+            raise ValidationError("sku must be a SKU instance")
+        if not isinstance(self.location, Location):
+            raise ValidationError("location must be a Location instance")
+        self.ordered_units = _require_positive(self.ordered_units, "ordered_units")
+        self.reserved_units = _require_non_negative(self.reserved_units, "reserved_units")
+        self.shipped_units = _require_non_negative(self.shipped_units, "shipped_units")
+        if self.reserved_units + self.shipped_units > self.ordered_units:
+            raise ValidationError(
+                "reserved_units plus shipped_units cannot exceed ordered_units"
+            )
+
+    @property
+    def unallocated(self) -> int:
+        """Units on this line that no reservation covers yet."""
+        return self.ordered_units - self.reserved_units - self.shipped_units
+
+    @property
+    def unshipped(self) -> int:
+        """Reserved units still sitting in the bin."""
+        return self.reserved_units
+
+    @property
+    def is_allocated(self) -> bool:
+        return self.unallocated == 0
+
+    @property
+    def is_fulfilled(self) -> bool:
+        return self.shipped_units == self.ordered_units
+
+    def allocate(self, units: int) -> None:
+        """Claim ``units`` of stock for this line."""
+        units = _require_positive(units, "units")
+        if units > self.unallocated:
+            raise SalesOrderError(
+                f"cannot allocate {units} of {self.sku.code}: "
+                f"only {self.unallocated} unallocated on this line"
+            )
+        self.reserved_units += units
+
+    def release(self, units: int) -> None:
+        """Give up ``units`` of this line's claim without shipping them."""
+        units = _require_positive(units, "units")
+        if units > self.reserved_units:
+            raise SalesOrderError(
+                f"cannot release {units} of {self.sku.code}: "
+                f"only {self.reserved_units} reserved on this line"
+            )
+        self.reserved_units -= units
+
+    def ship(self, units: int) -> None:
+        """Turn ``units`` of this line's claim into a shipment."""
+        units = _require_positive(units, "units")
+        if units > self.reserved_units:
+            raise SalesOrderError(
+                f"cannot ship {units} of {self.sku.code}: "
+                f"only {self.reserved_units} reserved on this line"
+            )
+        self.reserved_units -= units
+        self.shipped_units += units
+
+    def copy(self) -> "SalesOrderLine":
+        """A detached duplicate, used for transaction snapshots."""
+        return SalesOrderLine(
+            sku=self.sku,
+            location=self.location,
+            ordered_units=self.ordered_units,
+            reserved_units=self.reserved_units,
+            shipped_units=self.shipped_units,
+        )
+
+
+@dataclass
+class SalesOrder:
+    """What we owe a customer, and how much of it has been claimed and shipped.
+
+    An order that has been allocated holds real reservations against
+    :class:`StockLevel` records, so the same units cannot be promised to a
+    second order.  ``status`` is derived from the lines and ``cancelled``.
+    """
+
+    reference: str
+    customer: str
+    lines: List[SalesOrderLine]
+    cancelled: bool = False
+    created_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        self.reference = _require_text(self.reference, "reference")
+        self.customer = _require_text(self.customer, "customer")
+        if not isinstance(self.cancelled, bool):
+            raise ValidationError("cancelled must be a bool")
+
+        lines = list(self.lines)
+        if not lines:
+            raise ValidationError("a sales order needs at least one line")
+        seen = set()
+        for line in lines:
+            if not isinstance(line, SalesOrderLine):
+                raise ValidationError("lines must contain SalesOrderLine instances")
+            if line.sku.code in seen:
+                raise ValidationError(
+                    f"sales order {self.reference!r} has two lines for "
+                    f"sku {line.sku.code!r}; order each SKU on one line"
+                )
+            seen.add(line.sku.code)
+        self.lines = lines
+
+        if self.created_at is None:
+            self.created_at = datetime.now(timezone.utc)
+        elif not isinstance(self.created_at, datetime):
+            raise ValidationError("created_at must be a datetime")
+
+    @property
+    def line_keys(self) -> Tuple[str, ...]:
+        """The SKU code of every line, in order."""
+        return tuple(line.sku.code for line in self.lines)
+
+    @property
+    def ordered_units(self) -> int:
+        return sum(line.ordered_units for line in self.lines)
+
+    @property
+    def reserved_units(self) -> int:
+        """Units currently held aside on stock records for this order."""
+        return sum(line.reserved_units for line in self.lines)
+
+    @property
+    def shipped_units(self) -> int:
+        return sum(line.shipped_units for line in self.lines)
+
+    @property
+    def unallocated_units(self) -> int:
+        return sum(line.unallocated for line in self.lines)
+
+    @property
+    def is_fully_allocated(self) -> bool:
+        return all(line.is_allocated for line in self.lines)
+
+    @property
+    def is_fulfilled(self) -> bool:
+        return all(line.is_fulfilled for line in self.lines)
+
+    @property
+    def locations(self) -> Tuple[Location, ...]:
+        """The distinct bins this order ships from, in line order."""
+        seen: List[Location] = []
+        for line in self.lines:
+            if all(existing.code != line.location.code for existing in seen):
+                seen.append(line.location)
+        return tuple(seen)
+
+    @property
+    def status(self) -> str:
+        """One of ``open``, ``partial``, ``allocated``, ``fulfilled``, ``cancelled``."""
+        if self.cancelled:
+            return SALES_CANCELLED
+        if self.is_fulfilled:
+            return SALES_FULFILLED
+        if self.shipped_units:
+            return SALES_PARTIAL
+        if self.is_fully_allocated:
+            return SALES_ALLOCATED
+        if self.reserved_units:
+            return SALES_PARTIAL
+        return SALES_OPEN
+
+    def line(self, sku_code: str) -> SalesOrderLine:
+        """The line for ``sku_code``; raises :class:`NotFound` if absent."""
+        for line in self.lines:
+            if line.sku.code == sku_code:
+                return line
+        raise NotFound(f"sales order {self.reference!r} has no line for sku {sku_code!r}")
+
+    def copy(self) -> "SalesOrder":
+        """A detached duplicate, used for transaction snapshots."""
+        return SalesOrder(
+            reference=self.reference,
+            customer=self.customer,
+            lines=[line.copy() for line in self.lines],
+            cancelled=self.cancelled,
+            created_at=self.created_at,
+        )
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return (
+            f"{self.reference} ({self.customer}) {self.status} "
+            f"reserved={self.reserved_units} shipped={self.shipped_units}"
+            f"/{self.ordered_units}"
         )
