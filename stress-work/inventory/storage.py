@@ -24,7 +24,7 @@ from typing import Dict, Iterable, Iterator, List, Optional, Sequence
 
 from .errors import NotFound, StorageError
 from .migrations import LATEST_VERSION, MIGRATIONS, Migration, plan_migrations
-from .models import Location, Product, SKU, StockLevel
+from .models import Location, Product, PurchaseOrder, PurchaseOrderLine, SKU, StockLevel
 from .warehouse import Movement, Warehouse
 
 __all__ = ["SQLiteStore"]
@@ -351,14 +351,57 @@ class SQLiteStore:
         }
 
     # ------------------------------------------------------------------
+    # Purchase orders
+    # ------------------------------------------------------------------
+    def save_purchase_order(self, order: PurchaseOrder) -> PurchaseOrder:
+        """Insert or update an order and its lines; SKUs and bins must be stored."""
+        with self.transaction():
+            _upsert_purchase_order(self._conn, order)
+        return order
+
+    def save_purchase_orders(self, orders: Iterable[PurchaseOrder]) -> List[PurchaseOrder]:
+        batch = list(orders)
+        with self.transaction():
+            for order in batch:
+                _upsert_purchase_order(self._conn, order)
+        return batch
+
+    def get_purchase_order(self, reference: str) -> PurchaseOrder:
+        row = self._conn.execute(
+            "SELECT * FROM purchase_orders WHERE reference = ?", (reference,)
+        ).fetchone()
+        if row is None:
+            raise NotFound(f"no purchase order with reference {reference!r}")
+        return _purchase_order_from_row(row, self)
+
+    def list_purchase_orders(self) -> List[PurchaseOrder]:
+        """Every order, ordered by reference."""
+        rows = self._conn.execute(
+            "SELECT * FROM purchase_orders ORDER BY reference"
+        ).fetchall()
+        return [_purchase_order_from_row(row, self) for row in rows]
+
+    def count_purchase_orders(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM purchase_orders").fetchone()
+        return int(row["n"])
+
+    def list_purchase_order_lines(self, reference: str) -> List[PurchaseOrderLine]:
+        rows = self._conn.execute(
+            "SELECT * FROM purchase_order_lines WHERE reference = ? ORDER BY sku_code",
+            (reference,),
+        ).fetchall()
+        return [_purchase_order_line_from_row(row, self) for row in rows]
+
+    # ------------------------------------------------------------------
     # Whole-aggregate round trip
     # ------------------------------------------------------------------
     def save_warehouse(self, warehouse: Warehouse) -> Warehouse:
         """Persist a whole warehouse in a single transaction.
 
-        Saving twice is safe: catalog rows are upserted and the movement log is
-        replaced with the warehouse's current history, so the database mirrors
-        the in-memory aggregate instead of accumulating duplicates.
+        Saving twice is safe: catalog rows are upserted while the movement log
+        and purchase orders are replaced with the warehouse's current state, so
+        the database mirrors the in-memory aggregate instead of accumulating
+        duplicates.
         """
         if not isinstance(warehouse, Warehouse):
             raise StorageError("warehouse must be a Warehouse instance")
@@ -380,6 +423,9 @@ class SQLiteStore:
                     "INSERT INTO reorder_points (sku_code, units) VALUES (?, ?)",
                     (sku.code, warehouse.reorder_point(sku.code)),
                 )
+            self._conn.execute("DELETE FROM purchase_orders")
+            for order in warehouse.purchase_orders:
+                _upsert_purchase_order(self._conn, order)
         return warehouse
 
     def load_warehouse(self, name: str = "warehouse") -> Warehouse:
@@ -395,6 +441,7 @@ class SQLiteStore:
             stock_levels=self.list_stock_levels(),
             movements=self.list_movements(),
             reorder_points=self.list_reorder_points(),
+            purchase_orders=self.list_purchase_orders(),
         )
         return warehouse
 
@@ -478,6 +525,58 @@ def _upsert_stock_level(conn: sqlite3.Connection, record: StockLevel) -> None:
     )
 
 
+def _upsert_purchase_order(conn: sqlite3.Connection, order: PurchaseOrder) -> None:
+    """Write the header and replace the order's lines.
+
+    Lines are deleted and re-inserted rather than diffed: an order has a
+    handful of lines, and replacing them keeps the stored rows an exact mirror
+    of the aggregate.
+    """
+    for line in order.lines:
+        if conn.execute(
+            "SELECT 1 FROM skus WHERE code = ?", (line.sku.code,)
+        ).fetchone() is None:
+            raise NotFound(
+                f"cannot store purchase order {order.reference!r}: "
+                f"sku {line.sku.code!r} is not stored"
+            )
+        if conn.execute(
+            "SELECT 1 FROM locations WHERE code = ?", (line.location.code,)
+        ).fetchone() is None:
+            raise NotFound(
+                f"cannot store purchase order {order.reference!r}: "
+                f"location {line.location.code!r} is not stored"
+            )
+
+    conn.execute(
+        "INSERT INTO purchase_orders (reference, supplier, cancelled, created_at) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(reference) DO UPDATE SET "
+        "supplier = excluded.supplier, cancelled = excluded.cancelled, "
+        "created_at = excluded.created_at",
+        (
+            order.reference,
+            order.supplier,
+            int(order.cancelled),
+            _as_utc(order.created_at).isoformat(),
+        ),
+    )
+    conn.execute("DELETE FROM purchase_order_lines WHERE reference = ?", (order.reference,))
+    for line in order.lines:
+        conn.execute(
+            "INSERT INTO purchase_order_lines "
+            "(reference, sku_code, location_code, ordered_units, received_units) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                order.reference,
+                line.sku.code,
+                line.location.code,
+                line.ordered_units,
+                line.received_units,
+            ),
+        )
+
+
 def _insert_movement(conn: sqlite3.Connection, movement: Movement) -> None:
     conn.execute(
         "INSERT INTO movements (kind, sku_code, location_code, units, reference, recorded_at) "
@@ -542,6 +641,30 @@ def _movement_from_row(row: sqlite3.Row) -> Movement:
         units=row["units"],
         reference=row["reference"],
         recorded_at=recorded_at,
+    )
+
+
+def _purchase_order_line_from_row(
+    row: sqlite3.Row, store: SQLiteStore
+) -> PurchaseOrderLine:
+    return PurchaseOrderLine(
+        sku=store.get_sku(row["sku_code"]),
+        location=store.get_location(row["location_code"]),
+        ordered_units=row["ordered_units"],
+        received_units=row["received_units"],
+    )
+
+
+def _purchase_order_from_row(row: sqlite3.Row, store: SQLiteStore) -> PurchaseOrder:
+    created_at = datetime.fromisoformat(row["created_at"])
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return PurchaseOrder(
+        reference=row["reference"],
+        supplier=row["supplier"],
+        lines=store.list_purchase_order_lines(row["reference"]),
+        cancelled=bool(row["cancelled"]),
+        created_at=created_at,
     )
 
 

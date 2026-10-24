@@ -48,8 +48,9 @@ class PlanMigrationsTests(unittest.TestCase):
         self.assertEqual(pending, MIGRATIONS)
 
     def test_applied_versions_are_skipped(self):
-        pending = plan_migrations([1, 2])
-        self.assertEqual([migration.version for migration in pending], [3])
+        versions = [migration.version for migration in MIGRATIONS]
+        pending = plan_migrations(versions[:-1])
+        self.assertEqual([migration.version for migration in pending], [versions[-1]])
 
     def test_unknown_ahead_versions_change_nothing(self):
         pending = plan_migrations([version for version in range(1, 100)])

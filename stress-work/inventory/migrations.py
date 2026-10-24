@@ -112,11 +112,36 @@ CREATE INDEX IF NOT EXISTS idx_movements_recorded_at ON movements (recorded_at);
 CREATE INDEX IF NOT EXISTS idx_stock_low ON stock_levels (reorder_point) WHERE reorder_point > 0;
 """
 
+# ---------------------------------------------------------------------------
+# 004 -- purchase orders and the lines that make them up
+# ---------------------------------------------------------------------------
+_CREATE_PURCHASE_ORDERS = """
+CREATE TABLE IF NOT EXISTS purchase_orders (
+    reference   TEXT    PRIMARY KEY,
+    supplier    TEXT    NOT NULL,
+    cancelled   INTEGER NOT NULL DEFAULT 0 CHECK (cancelled IN (0, 1)),
+    created_at  TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS purchase_order_lines (
+    reference       TEXT    NOT NULL REFERENCES purchase_orders (reference) ON DELETE CASCADE,
+    sku_code        TEXT    NOT NULL REFERENCES skus (code) ON DELETE RESTRICT,
+    location_code   TEXT    NOT NULL REFERENCES locations (code) ON DELETE RESTRICT,
+    ordered_units   INTEGER NOT NULL CHECK (ordered_units >= 1),
+    received_units  INTEGER NOT NULL DEFAULT 0 CHECK (received_units >= 0),
+    PRIMARY KEY (reference, sku_code),
+    CHECK (received_units <= ordered_units)
+);
+
+CREATE INDEX IF NOT EXISTS idx_po_lines_sku ON purchase_order_lines (sku_code);
+"""
+
 
 MIGRATIONS: Tuple[Migration, ...] = (
     Migration(version=1, name="create_catalog", sql=_CREATE_CATALOG),
     Migration(version=2, name="create_stock_and_movements", sql=_CREATE_STOCK),
     Migration(version=3, name="create_reorder_points", sql=_CREATE_REORDER_POINTS),
+    Migration(version=4, name="create_purchase_orders", sql=_CREATE_PURCHASE_ORDERS),
 )
 
 LATEST_VERSION: int = max(migration.version for migration in MIGRATIONS)

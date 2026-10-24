@@ -16,6 +16,9 @@ from inventory import (
     Movement,
     NotFound,
     Product,
+    PurchaseOrder,
+    PurchaseOrderError,
+    PurchaseOrderLine,
     SKU,
     SQLiteStore,
     StorageError,
@@ -31,6 +34,8 @@ TABLE_NAMES = {
     "stock_levels",
     "movements",
     "reorder_points",
+    "purchase_orders",
+    "purchase_order_lines",
     "schema_migrations",
 }
 
@@ -415,6 +420,75 @@ class WarehouseRoundTripTests(unittest.TestCase):
             self.assertEqual(len(store.list_stock_levels()), 2)
             self.assertEqual(store.list_reorder_points(), {"s-1": 5})
 
+    def build_with_orders(self):
+        """The base warehouse plus one partially received and one cancelled order."""
+        warehouse = self.build()
+        warehouse.create_purchase_order(
+            "PO-10",
+            "Acme Supply",
+            [PurchaseOrderLine(warehouse.sku("s-1"), warehouse.location("A-01"), 20)],
+        )
+        warehouse.receive_purchase_order("PO-10", {"s-1": 8})
+        warehouse.create_purchase_order(
+            "PO-11",
+            "Beta Trading",
+            [PurchaseOrderLine(warehouse.sku("s-1"), warehouse.location("B-01"), 4)],
+        )
+        warehouse.cancel_purchase_order("PO-11")
+        return warehouse
+
+    def test_purchase_orders_survive_a_round_trip(self):
+        warehouse = self.build_with_orders()
+        with SQLiteStore() as store:
+            store.save_warehouse(warehouse)
+            loaded = store.load_warehouse()
+
+            self.assertEqual(loaded.purchase_orders, warehouse.purchase_orders)
+            partial = loaded.purchase_order("PO-10")
+            self.assertEqual(partial.status, "partial")
+            self.assertEqual(partial.ordered_units, 20)
+            self.assertEqual(partial.received_units, 8)
+            self.assertEqual(partial.supplier, "Acme Supply")
+            self.assertEqual(loaded.purchase_order("PO-11").status, "cancelled")
+            # the receipt itself landed in stock
+            self.assertEqual(loaded.on_hand("s-1"), warehouse.on_hand("s-1"))
+            self.assertEqual(loaded.stock("s-1", "A-01").quantity, 15)
+            self.assertEqual(len(loaded.movements), len(warehouse.movements))
+
+    def test_a_loaded_order_can_still_be_received(self):
+        with SQLiteStore() as store:
+            store.save_warehouse(self.build_with_orders())
+            loaded = store.load_warehouse()
+
+            loaded.receive_purchase_order("PO-10", {"s-1": 4})
+            self.assertEqual(loaded.purchase_order("PO-10").status, "partial")
+            loaded.receive_purchase_order("PO-10")
+            self.assertEqual(loaded.purchase_order("PO-10").status, "received")
+            self.assertEqual(loaded.purchase_order("PO-10").received_units, 20)
+            with self.assertRaises(PurchaseOrderError):
+                loaded.cancel_purchase_order("PO-10")
+            self.assertEqual(loaded.purchase_order("PO-11").status, "cancelled")
+
+    def test_a_warehouse_without_orders_loads_without_orders(self):
+        with SQLiteStore() as store:
+            store.save_warehouse(self.build())
+            self.assertEqual(store.load_warehouse().purchase_orders, [])
+
+    def test_replacing_a_warehouse_removes_orders_that_are_gone(self):
+        with SQLiteStore() as store:
+            store.save_warehouse(self.build_with_orders())
+            store.save_warehouse(self.build())
+            self.assertEqual(store.count_purchase_orders(), 0)
+            self.assertEqual(store.list_purchase_order_lines("PO-10"), [])
+
+    def test_saving_a_warehouse_with_orders_twice_does_not_duplicate_lines(self):
+        warehouse = self.build_with_orders()
+        with SQLiteStore() as store:
+            store.save_warehouse(warehouse)
+            store.save_warehouse(warehouse)
+            self.assertEqual(store.count_purchase_orders(), 2)
+            self.assertEqual(len(store.list_purchase_order_lines("PO-10")), 1)
+
     def test_saving_a_non_warehouse_is_refused(self):
         with SQLiteStore() as store:
             with self.assertRaises(StorageError):
@@ -433,6 +507,101 @@ class WarehouseRoundTripTests(unittest.TestCase):
             loaded = store.load_warehouse()
             self.assertEqual(len(loaded.low_stock()), 1)
             self.assertTrue(loaded.low_stock()[0].is_low)
+
+
+class PurchaseOrderPersistenceTests(StoreTestCase):
+    def order(self, reference="PO-1", **overrides):
+        fields = {
+            "reference": reference,
+            "supplier": "Acme Supply",
+            "lines": [PurchaseOrderLine(self.sku, self.bin_a, 10, 4)],
+        }
+        fields.update(overrides)
+        return PurchaseOrder(**fields)
+
+    def test_a_purchase_order_round_trips_with_its_lines(self):
+        self.store.save_purchase_order(self.order())
+        loaded = self.store.get_purchase_order("PO-1")
+        self.assertEqual(loaded.reference, "PO-1")
+        self.assertEqual(loaded.supplier, "Acme Supply")
+        self.assertEqual(loaded.ordered_units, 10)
+        self.assertEqual(loaded.received_units, 4)
+        self.assertEqual(loaded.outstanding_units, 6)
+        self.assertEqual(loaded.status, "partial")
+        self.assertEqual(loaded.line("s-1").location, self.bin_a)
+
+    def test_the_cancelled_flag_round_trips(self):
+        self.store.save_purchase_order(self.order())
+        self.assertEqual(self.store.get_purchase_order("PO-1").status, "partial")
+        self.store.save_purchase_order(self.order(cancelled=True))
+        self.assertEqual(self.store.get_purchase_order("PO-1").status, "cancelled")
+
+    def test_resaving_an_order_replaces_its_lines_rather_than_duplicating(self):
+        self.store.save_purchase_order(self.order())
+        changed = self.order(lines=[PurchaseOrderLine(self.sku, self.bin_b, 3, 3)])
+        self.store.save_purchase_order(changed)
+        self.assertEqual(self.store.count_purchase_orders(), 1)
+        lines = self.store.list_purchase_order_lines("PO-1")
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0].location.code, "B-01")
+        self.assertEqual(lines[0].ordered_units, 3)
+        self.assertEqual(self.store.get_purchase_order("PO-1").status, "received")
+
+    def test_orders_are_listed_in_reference_order(self):
+        self.store.save_purchase_orders([self.order("PO-2"), self.order("PO-1")])
+        self.assertEqual(
+            [order.reference for order in self.store.list_purchase_orders()],
+            ["PO-1", "PO-2"],
+        )
+        self.assertEqual(self.store.list_purchase_order_lines("PO-404"), [])
+
+    def test_a_missing_order_raises_not_found(self):
+        with self.assertRaises(NotFound):
+            self.store.get_purchase_order("PO-404")
+
+    def test_an_order_cannot_be_stored_without_its_sku_or_location(self):
+        other_product = self.store.save_product(Product("p-2", "Gadget"))
+        other_sku = self.store.save_sku(SKU("s-2", other_product))
+        with self.assertRaises(NotFound):
+            self.store.save_purchase_order(
+                self.order(lines=[PurchaseOrderLine(SKU("s-404", other_product), self.bin_a, 1)])
+            )
+        with self.assertRaises(NotFound):
+            self.store.save_purchase_order(
+                self.order(lines=[PurchaseOrderLine(other_sku, Location("L-404", "Ghost"), 1)])
+            )
+
+    def test_deleting_an_order_cascades_to_its_lines(self):
+        self.store.save_purchase_order(self.order())
+        self.store.connection.execute("DELETE FROM purchase_orders WHERE reference = 'PO-1'")
+        self.assertEqual(self.store.list_purchase_order_lines("PO-1"), [])
+
+    def test_the_schema_forbids_receiving_more_than_was_ordered(self):
+        self.store.save_purchase_order(self.order())
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "UPDATE purchase_order_lines SET received_units = 11 WHERE reference = 'PO-1'"
+            )
+
+    def test_the_schema_forbids_an_empty_or_negative_line(self):
+        for ordered in (0, -1):
+            with self.subTest(ordered_units=ordered):
+                with self.assertRaises(sqlite3.IntegrityError):
+                    self.store.connection.execute(
+                        "INSERT INTO purchase_order_lines "
+                        "(reference, sku_code, location_code, ordered_units, received_units) "
+                        "VALUES ('PO-X', 's-1', 'A-01', ?, 0)",
+                        (ordered,),
+                    )
+
+    def test_a_line_cannot_point_at_a_missing_sku(self):
+        self.store.save_purchase_order(self.order())
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.store.connection.execute(
+                "INSERT INTO purchase_order_lines "
+                "(reference, sku_code, location_code, ordered_units, received_units) "
+                "VALUES ('PO-1', 's-404', 'A-01', 1, 0)"
+            )
 
 
 class FileStorageTests(unittest.TestCase):

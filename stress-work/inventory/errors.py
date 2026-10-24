@@ -34,5 +34,13 @@ class MigrationError(InventoryError):
     """Raised when a migration set is malformed, e.g. duplicate versions."""
 
 
+class PurchaseOrderError(InventoryError):
+    """Raised when a purchase-order operation is invalid for the order's state.
+
+    Over-receiving, receiving against a cancelled or completed order, and
+    cancelling an order that already has receipts all land here.
+    """
+
+
 class StorageError(InventoryError):
     """Raised when the SQLite persistence layer cannot satisfy a request."""

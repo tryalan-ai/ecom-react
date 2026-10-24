@@ -9,12 +9,24 @@ mutable model, because on-hand quantities change constantly.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Optional
+from typing import List, Optional, Tuple
 
-from .errors import InsufficientStock, ValidationError
+from .errors import InsufficientStock, NotFound, PurchaseOrderError, ValidationError
 
-__all__ = ["Product", "SKU", "Location", "StockLevel"]
+__all__ = [
+    "Product",
+    "SKU",
+    "Location",
+    "StockLevel",
+    "PurchaseOrderLine",
+    "PurchaseOrder",
+    "ORDER_OPEN",
+    "ORDER_PARTIAL",
+    "ORDER_RECEIVED",
+    "ORDER_CANCELLED",
+]
 
 
 def _require_text(value: object, field_name: str) -> str:
@@ -209,5 +221,178 @@ class StockLevel:
             )
         self.reserved -= units
 
+    def copy(self) -> "StockLevel":
+        """A detached duplicate of this record, used for transaction snapshots."""
+        return StockLevel(
+            sku=self.sku,
+            location=self.location,
+            quantity=self.quantity,
+            reserved=self.reserved,
+            reorder_point=self.reorder_point,
+        )
+
     def __str__(self) -> str:  # pragma: no cover - trivial
         return f"{self.sku.code}@{self.location.code}={self.quantity}({self.reserved} reserved)"
+
+
+# Purchase order lifecycle states.  An order's status is always derived from
+# its lines and its cancellation flag, never stored, so the two cannot drift.
+ORDER_OPEN = "open"
+ORDER_PARTIAL = "partial"
+ORDER_RECEIVED = "received"
+ORDER_CANCELLED = "cancelled"
+
+PURCHASE_ORDER_STATES: Tuple[str, ...] = (
+    ORDER_OPEN,
+    ORDER_PARTIAL,
+    ORDER_RECEIVED,
+    ORDER_CANCELLED,
+)
+
+
+@dataclass
+class PurchaseOrderLine:
+    """One SKU bought from a supplier, and the bin it should land in."""
+
+    sku: SKU
+    location: Location
+    ordered_units: int
+    received_units: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.sku, SKU):
+            raise ValidationError("sku must be a SKU instance")
+        if not isinstance(self.location, Location):
+            raise ValidationError("location must be a Location instance")
+        self.ordered_units = _require_positive(self.ordered_units, "ordered_units")
+        self.received_units = _require_non_negative(self.received_units, "received_units")
+        if self.received_units > self.ordered_units:
+            raise ValidationError("received_units cannot exceed ordered_units")
+
+    @property
+    def outstanding(self) -> int:
+        """Units still awaited on this line."""
+        return self.ordered_units - self.received_units
+
+    @property
+    def is_complete(self) -> bool:
+        """Return ``True`` once the whole ordered quantity has been booked in."""
+        return self.received_units == self.ordered_units
+
+    def receive(self, units: int) -> None:
+        """Book ``units`` against this line, refusing to over-receive."""
+        units = _require_positive(units, "units")
+        if units > self.outstanding:
+            raise PurchaseOrderError(
+                f"cannot receive {units} of {self.sku.code}: "
+                f"only {self.outstanding} outstanding on this line"
+            )
+        self.received_units += units
+
+    def copy(self) -> "PurchaseOrderLine":
+        """A detached duplicate, used for transaction snapshots."""
+        return PurchaseOrderLine(
+            sku=self.sku,
+            location=self.location,
+            ordered_units=self.ordered_units,
+            received_units=self.received_units,
+        )
+
+
+@dataclass
+class PurchaseOrder:
+    """What a supplier owes us, and how much of it has arrived.
+
+    ``cancelled`` is settable at construction only so a persisted or cloned
+    order can be rebuilt; use :meth:`Warehouse.cancel_purchase_order` to
+    cancel one.  ``status`` is derived from ``cancelled`` and the lines.
+    """
+
+    reference: str
+    supplier: str
+    lines: List[PurchaseOrderLine]
+    cancelled: bool = False
+    created_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        self.reference = _require_text(self.reference, "reference")
+        self.supplier = _require_text(self.supplier, "supplier")
+        if not isinstance(self.cancelled, bool):
+            raise ValidationError("cancelled must be a bool")
+
+        lines = list(self.lines)
+        if not lines:
+            raise ValidationError("a purchase order needs at least one line")
+        seen = set()
+        for line in lines:
+            if not isinstance(line, PurchaseOrderLine):
+                raise ValidationError("lines must contain PurchaseOrderLine instances")
+            if line.sku.code in seen:
+                raise ValidationError(
+                    f"purchase order {self.reference!r} has two lines for "
+                    f"sku {line.sku.code!r}; order each SKU on one line"
+                )
+            seen.add(line.sku.code)
+        self.lines = lines
+
+        if self.created_at is None:
+            self.created_at = datetime.now(timezone.utc)
+        elif not isinstance(self.created_at, datetime):
+            raise ValidationError("created_at must be a datetime")
+
+    @property
+    def line_keys(self) -> Tuple[str, ...]:
+        """The SKU code of every line, in order."""
+        return tuple(line.sku.code for line in self.lines)
+
+    @property
+    def ordered_units(self) -> int:
+        return sum(line.ordered_units for line in self.lines)
+
+    @property
+    def received_units(self) -> int:
+        return sum(line.received_units for line in self.lines)
+
+    @property
+    def outstanding_units(self) -> int:
+        return sum(line.outstanding for line in self.lines)
+
+    @property
+    def is_fully_received(self) -> bool:
+        return all(line.is_complete for line in self.lines)
+
+    @property
+    def status(self) -> str:
+        """One of ``open``, ``partial``, ``received`` or ``cancelled``."""
+        if self.cancelled:
+            return ORDER_CANCELLED
+        if self.is_fully_received:
+            return ORDER_RECEIVED
+        if self.received_units:
+            return ORDER_PARTIAL
+        return ORDER_OPEN
+
+    def line(self, sku_code: str) -> PurchaseOrderLine:
+        """The line for ``sku_code``; raises :class:`NotFound` if absent."""
+        for line in self.lines:
+            if line.sku.code == sku_code:
+                return line
+        raise NotFound(
+            f"purchase order {self.reference!r} has no line for sku {sku_code!r}"
+        )
+
+    def copy(self) -> "PurchaseOrder":
+        """A detached duplicate, used for transaction snapshots."""
+        return PurchaseOrder(
+            reference=self.reference,
+            supplier=self.supplier,
+            lines=[line.copy() for line in self.lines],
+            cancelled=self.cancelled,
+            created_at=self.created_at,
+        )
+
+    def __str__(self) -> str:  # pragma: no cover - trivial
+        return (
+            f"{self.reference} ({self.supplier}) {self.status} "
+            f"{self.received_units}/{self.ordered_units}"
+        )

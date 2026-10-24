@@ -8,12 +8,20 @@ product, and a location may never hold more units than its capacity).
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
-from .errors import CapacityExceeded, DuplicateEntity, InsufficientStock, NotFound, ValidationError
-from .models import Location, Product, SKU, StockLevel
+from .errors import (
+    CapacityExceeded,
+    DuplicateEntity,
+    InsufficientStock,
+    NotFound,
+    PurchaseOrderError,
+    ValidationError,
+)
+from .models import Location, Product, PurchaseOrder, PurchaseOrderLine, SKU, StockLevel
 
 __all__ = ["Movement", "Warehouse"]
 
@@ -35,7 +43,7 @@ class Movement:
 
 
 class Warehouse:
-    """A registry of products, SKUs, locations and their stock levels."""
+    """A registry of products, SKUs, locations, stock levels and orders."""
 
     def __init__(self, name: str = "warehouse") -> None:
         if not isinstance(name, str) or not name.strip():
@@ -47,6 +55,56 @@ class Warehouse:
         self._stock: Dict[Tuple[str, str], StockLevel] = {}
         self._reorder_defaults: Dict[str, int] = {}
         self._movements: List[Movement] = []
+        self._purchase_orders: Dict[str, PurchaseOrder] = {}
+        self._in_transaction = False
+
+    # ------------------------------------------------------------------
+    # Transactions
+    # ------------------------------------------------------------------
+    @contextmanager
+    def transaction(self) -> Iterator["Warehouse"]:
+        """Run a group of changes atomically.
+
+        Everything mutable is snapshotted on entry and restored if the block
+        raises, so a multi-line receipt either lands completely or not at all.
+        A rollback swaps the warehouse's records for the restored copies, which
+        means any aggregate handed out before the failure is detached.
+        """
+        if self._in_transaction:
+            raise ValidationError("nested warehouse transactions are not supported")
+        snapshot = self._snapshot()
+        self._in_transaction = True
+        try:
+            yield self
+        except BaseException:
+            self._restore(snapshot)
+            raise
+        finally:
+            self._in_transaction = False
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._in_transaction
+
+    def _snapshot(self) -> Dict[str, Any]:
+        return {
+            "products": dict(self._products),
+            "skus": dict(self._skus),
+            "locations": dict(self._locations),
+            "stock": {key: record.copy() for key, record in self._stock.items()},
+            "reorder_points": dict(self._reorder_defaults),
+            "movements": list(self._movements),
+            "orders": {ref: order.copy() for ref, order in self._purchase_orders.items()},
+        }
+
+    def _restore(self, snapshot: Dict[str, Any]) -> None:
+        self._products = snapshot["products"]
+        self._skus = snapshot["skus"]
+        self._locations = snapshot["locations"]
+        self._stock = snapshot["stock"]
+        self._reorder_defaults = snapshot["reorder_points"]
+        self._movements = snapshot["movements"]
+        self._purchase_orders = snapshot["orders"]
 
     # ------------------------------------------------------------------
     # Registration
@@ -318,6 +376,139 @@ class Warehouse:
         )
 
     # ------------------------------------------------------------------
+    # Purchase orders
+    # ------------------------------------------------------------------
+    @property
+    def purchase_orders(self) -> List[PurchaseOrder]:
+        """Every purchase order, ordered by reference."""
+        return sorted(self._purchase_orders.values(), key=lambda order: order.reference)
+
+    def purchase_order(self, reference: str) -> PurchaseOrder:
+        """The live (mutable) purchase order with this reference."""
+        try:
+            return self._purchase_orders[reference]
+        except KeyError as exc:
+            raise NotFound(f"no purchase order with reference {reference!r}") from exc
+
+    def create_purchase_order(
+        self,
+        reference: str,
+        supplier: str,
+        lines: Iterable[PurchaseOrderLine],
+    ) -> PurchaseOrder:
+        """Raise an order for goods we expect to arrive.
+
+        Each line is normalised onto the *registered* SKU and location objects,
+        and every order starts with nothing received.
+        """
+        if reference in self._purchase_orders:
+            raise DuplicateEntity(f"purchase order {reference!r} already exists")
+
+        normalised: List[PurchaseOrderLine] = []
+        for line in lines:
+            if not isinstance(line, PurchaseOrderLine):
+                raise ValidationError("lines must contain PurchaseOrderLine instances")
+            sku = self._skus.get(line.sku.code)
+            if sku is None:
+                raise NotFound(f"cannot order sku {line.sku.code!r}: it is not registered")
+            location = self._locations.get(line.location.code)
+            if location is None:
+                raise NotFound(
+                    f"cannot order into location {line.location.code!r}: it is not registered"
+                )
+            normalised.append(
+                PurchaseOrderLine(
+                    sku=sku, location=location, ordered_units=line.ordered_units
+                )
+            )
+
+        order = PurchaseOrder(reference=reference, supplier=supplier, lines=normalised)
+        self._purchase_orders[order.reference] = order
+        return order
+
+    def receive_purchase_order(
+        self,
+        reference: str,
+        receipts: Optional[Mapping[str, int]] = None,
+    ) -> PurchaseOrder:
+        """Book goods in against an order, updating stock atomically.
+
+        ``receipts`` maps SKU code to units for a partial receipt.  Pass
+        ``None`` to receive everything still outstanding.  The single
+        transaction covers both the lines' received counts and the stock they
+        create, so an over-capacity bin on any line leaves the order and the
+        stock exactly as they were.
+        """
+        order = self.purchase_order(reference)
+        if order.cancelled:
+            raise PurchaseOrderError(f"purchase order {reference!r} is cancelled")
+        if order.is_fully_received:
+            raise PurchaseOrderError(f"purchase order {reference!r} is already fully received")
+
+        planned = self._plan_receipts(order, receipts)
+        with self.transaction():
+            for sku_code, units in planned.items():
+                line = order.line(sku_code)
+                line.receive(units)
+                self.receive(sku_code, line.location.code, units, reference=order.reference)
+        return order
+
+    def cancel_purchase_order(self, reference: str) -> PurchaseOrder:
+        """Cancel an order that nothing has been received against yet."""
+        order = self.purchase_order(reference)
+        if order.cancelled:
+            raise PurchaseOrderError(f"purchase order {reference!r} is already cancelled")
+        if order.received_units:
+            raise PurchaseOrderError(
+                f"cannot cancel purchase order {reference!r}: "
+                f"{order.received_units} units have already been received"
+            )
+        order.cancelled = True
+        return order
+
+    def _plan_receipts(
+        self, order: PurchaseOrder, receipts: Optional[Mapping[str, int]]
+    ) -> Dict[str, int]:
+        """Validate a receipt request and return {sku_code: units} to book."""
+        if receipts is None:
+            planned = {
+                line.sku.code: line.outstanding for line in order.lines if line.outstanding
+            }
+            if not planned:
+                raise PurchaseOrderError(
+                    f"purchase order {order.reference!r} has nothing outstanding"
+                )
+            return planned
+
+        if not isinstance(receipts, Mapping):
+            raise ValidationError("receipts must be a mapping of sku code to units, or None")
+        if not receipts:
+            raise ValidationError(
+                "receipts must not be empty; pass None to receive everything outstanding"
+            )
+
+        planned = {}
+        for sku_code, units in receipts.items():
+            if isinstance(units, bool) or not isinstance(units, int):
+                raise ValidationError(f"receipt for {sku_code!r} must be a whole number")
+            if units <= 0:
+                raise ValidationError(
+                    f"receipt for {sku_code!r} must be greater than zero, got {units}"
+                )
+            if sku_code not in order.line_keys:
+                raise ValidationError(
+                    f"purchase order {order.reference!r} has no line for sku {sku_code!r}"
+                )
+            line = order.line(sku_code)
+            if units > line.outstanding:
+                raise PurchaseOrderError(
+                    f"cannot receive {units} of {sku_code}: "
+                    f"only {line.outstanding} outstanding on this line"
+                )
+            planned[sku_code] = units
+        return planned
+
+    # ------------------------------------------------------------------
     # Rehydration
     # ------------------------------------------------------------------
     def restore(
@@ -326,6 +517,7 @@ class Warehouse:
         stock_levels: Iterable[StockLevel] = (),
         movements: Iterable[Movement] = (),
         reorder_points: Optional[Mapping[str, int]] = None,
+        purchase_orders: Iterable[PurchaseOrder] = (),
     ) -> None:
         """Load persisted state into a warehouse whose catalog is registered.
 
@@ -335,13 +527,13 @@ class Warehouse:
         and is validated against, never replaced.
 
         The whole snapshot is validated before any state is mutated, and
-        restoring onto a warehouse that already holds stock or movements
-        raises :class:`ValidationError` so halves of two snapshots cannot be
-        silently merged.
+        restoring onto a warehouse that already holds state raises
+        :class:`ValidationError` so halves of two snapshots cannot be silently
+        merged.
         """
-        if self._stock or self._movements:
+        if self._stock or self._movements or self._purchase_orders:
             raise ValidationError(
-                "cannot restore into a warehouse that already holds stock or movements"
+                "cannot restore into a warehouse that already holds state"
             )
 
         defaults: Dict[str, int] = {}
@@ -369,9 +561,25 @@ class Warehouse:
                 )
             pending[key] = record
 
+        pending_orders: Dict[str, PurchaseOrder] = {}
+        for order in purchase_orders:
+            if not isinstance(order, PurchaseOrder):
+                raise ValidationError("purchase_orders must contain PurchaseOrder instances")
+            if order.reference in pending_orders:
+                raise DuplicateEntity(f"duplicate purchase order {order.reference!r}")
+            for line in order.lines:
+                if line.sku.code not in self._skus:
+                    raise NotFound(f"cannot restore order: no sku {line.sku.code!r}")
+                if line.location.code not in self._locations:
+                    raise NotFound(
+                        f"cannot restore order: no location {line.location.code!r}"
+                    )
+            pending_orders[order.reference] = order
+
         # Everything below this line is mutation, and cannot fail.
         self._reorder_defaults = defaults
         self._stock.update(pending)
+        self._purchase_orders = pending_orders
         self._movements = list(movements)
 
     # ------------------------------------------------------------------
