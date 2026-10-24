@@ -157,5 +157,29 @@ class ParseCsvTests(unittest.TestCase):
         self.assertEqual(tagged.category, "Income")
 
 
+class FastPathTests(unittest.TestCase):
+    """Lock in the optimised fast paths for dates and plain amounts."""
+
+    def test_iso_date_with_pinned_format(self):
+        self.assertEqual(parse_date("2024-06-30", "%Y-%m-%d"), date(2024, 6, 30))
+
+    def test_pinned_iso_format_rejects_other_layout(self):
+        with self.assertRaises(ParseError):
+            parse_date("30/06/2024", "%Y-%m-%d")
+
+    def test_compact_iso_date(self):
+        self.assertEqual(parse_date("20240630"), date(2024, 6, 30))
+
+    def test_plain_negative_amount(self):
+        self.assertEqual(parse_amount("-12.34"), Decimal("-12.34"))
+
+    def test_plain_positive_sign_amount(self):
+        self.assertEqual(parse_amount("+12.34"), Decimal("12.34"))
+
+    def test_fast_path_rejects_malformed_number(self):
+        with self.assertRaises(ParseError):
+            parse_amount("12.34.56")
+
+
 if __name__ == "__main__":
     unittest.main()

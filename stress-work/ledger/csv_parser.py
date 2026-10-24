@@ -54,6 +54,8 @@ _ALIASES: dict[str, tuple[str, ...]] = {
 
 _CURRENCY_RE = re.compile(r"[^\d.,()+\-]")
 _NUMBER_RE = re.compile(r"^[+-]?\d{1,3}(?:,\d{3})*(?:\.\d+)?$|^[+-]?\d+(?:\.\d+)?$")
+# Fast path: a plain signed decimal with no currency, separators or parentheses.
+_SIMPLE_AMOUNT_RE = re.compile(r"[+-]?\d+(?:\.\d+)?\Z")
 
 
 def _normalise_header(name: str) -> str:
@@ -79,6 +81,10 @@ def parse_amount(raw: Any) -> Decimal:
         raise ParseError("amount is empty")
     if text in {"-", "+"}:
         return Decimal("0")
+    # Fast path for the overwhelmingly common "123" / "-123.45" shape, avoiding
+    # the currency/separator scrubbing and full-match used below.
+    if _SIMPLE_AMOUNT_RE.fullmatch(text):
+        return Decimal(text)
 
     negative = False
     if text.startswith("(") and text.endswith(")"):
@@ -119,6 +125,13 @@ def parse_date(raw: Any, date_format: str | None = None) -> date:
     text = str(raw).strip()
     if text == "":
         raise ParseError("date is empty")
+    # Fast path: ISO dates avoid the costly _strptime/locale machinery.
+    if date_format is None or date_format == "%Y-%m-%d":
+        try:
+            return date.fromisoformat(text)
+        except ValueError:
+            if date_format == "%Y-%m-%d":
+                raise ParseError(f"cannot parse date {raw!r}") from None
     formats = (date_format,) if date_format else DATE_FORMATS
     for fmt in formats:
         try:
@@ -243,20 +256,28 @@ def parse_csv(
     if "amount" not in columns and "debit" not in columns and "credit" not in columns:
         raise ParseError("no amount, debit or credit column found")
 
+    # Resolve column names once so the per-row loop avoids repeated dict lookups.
+    ncol = len(header)
+    date_col = columns["date"]
+    amount_col = columns.get("amount")
+    description_col = columns.get("description")
+    category_col = columns.get("category")
+
     transactions: list[Transaction] = []
     for line_no, row in enumerate(reader, start=2):
-        if not row or all(not str(cell).strip() for cell in row):
+        if not row or not "".join(row).strip():
             continue
-        record = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
+        if len(row) == ncol:
+            record = dict(zip(header, row))
+        else:
+            record = {header[i]: (row[i] if i < len(row) else "") for i in range(ncol)}
         try:
-            tx_date = parse_date(record.get(columns["date"], ""), date_format)
+            tx_date = parse_date(record.get(date_col, ""), date_format)
             amount = _amount_from_row(record, columns)
-            description = ""
-            if "description" in columns:
-                description = str(record.get(columns["description"], "")).strip()
+            description = record.get(description_col, "").strip() if description_col else ""
             category = None
-            if "category" in columns:
-                category = str(record.get(columns["category"], "")).strip() or None
+            if category_col:
+                category = record.get(category_col, "").strip() or None
             transactions.append(
                 Transaction(
                     date=tx_date,
